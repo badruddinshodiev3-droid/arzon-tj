@@ -1,0 +1,8 @@
+{
+  "name": "Arzon.tj - Marketplace Tajikistan",
+  "description": "Modern online marketplace for Tajikistan. Buy and sell cars, real estate, phones, electronics, and home goods with advanced search and multi-language support in Tajik, Russian, and English.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
