@@ -133,6 +133,7 @@ export function saveConversations(convs: Conversation[]): void {
  */
 export function getDeviceGuestId(): string {
   try {
+    if (typeof localStorage === 'undefined') return 'guest-buyer';
     let gid = localStorage.getItem('arzontj_guest_id');
     if (!gid) {
       gid = `guest-${Date.now().toString(36)}-${Math.random().toString(36).substring(2, 6)}`;
@@ -145,10 +146,26 @@ export function getDeviceGuestId(): string {
 }
 
 /**
+ * Normalizes user and seller IDs consistently across both phones
+ */
+export function normalizeUserId(rawIdOrPhone?: string | null): string {
+  if (!rawIdOrPhone) return getDeviceGuestId();
+  const trimmed = String(rawIdOrPhone).trim();
+  if (trimmed.startsWith('guest-')) return trimmed;
+  if (trimmed === 'guest-buyer') return getDeviceGuestId();
+  const digits = trimmed.replace(/\D/g, '');
+  if (digits.length === 9) return `user-992${digits}`;
+  if (digits.length >= 12 && digits.startsWith('992')) return `user-${digits}`;
+  if (digits.length >= 9) return `user-${digits}`;
+  return trimmed;
+}
+
+/**
  * Fetches conversations and messages from Supabase shared database
  */
 export async function syncConversationsFromSupabase(userId: string): Promise<Conversation[]> {
-  const supabase = getSupabase();
+  const normalizedId = normalizeUserId(userId);
+  const supabase = getSupabase(normalizedId);
   if (!supabase) return getStoredConversations();
 
   try {
@@ -157,6 +174,7 @@ export async function syncConversationsFromSupabase(userId: string): Promise<Con
       new Set(
         [
           userId,
+          normalizedId,
           cleanDigits.length >= 9 ? `user-${cleanDigits}` : null,
           cleanDigits.length >= 9 ? cleanDigits : null,
           cleanDigits.length >= 9 ? `+${cleanDigits}` : null,
@@ -172,7 +190,8 @@ export async function syncConversationsFromSupabase(userId: string): Promise<Con
     const { data: convData, error: convError } = await supabase
       .from('conversations')
       .select('*')
-      .or(orConditions);
+      .or(orConditions)
+      .setHeader('x-user-id', normalizedId);
 
     if (convError || !convData) {
       if (convError && !convError.message?.includes('schema cache') && convError.code !== 'PGRST205') {
@@ -264,138 +283,212 @@ export async function syncConversationsFromSupabase(userId: string): Promise<Con
 }
 
 /**
+ * Global Realtime broadcast channel name for instant cross-device delivery
+ */
+export const CHAT_BROADCAST_CHANNEL = 'arzon-chat-live-broadcast';
+
+/**
  * Sets up Realtime WebSocket subscription for live cross-device delivery
+ * Combines Postgres changes and Supabase Realtime Broadcast for instant delivery.
  */
 export function subscribeToLiveChat(
   userId: string,
   onNewMessage: (msg: ChatMessage, convId: string) => void,
   onChatUpdate?: () => void
 ): () => void {
-  const supabase = getSupabase();
+  const normalizedUserId = normalizeUserId(userId);
+  const supabase = getSupabase(normalizedUserId);
   if (!supabase) return () => {};
 
   try {
-    // Unique channel per subscriber to avoid collisions when modals unmount
-    const channelId = `chat-live-${userId}-${Date.now().toString(36)}-${Math.random().toString(36).substring(2, 7)}`;
-    const channel = supabase
-      .channel(channelId)
-      .on(
-        'postgres_changes',
-        {
-          event: '*',
-          schema: 'public',
-          table: 'messages',
-        },
-        async (payload) => {
-          const newMsgRow = (payload.new || payload.old) as any;
-          if (!newMsgRow || !newMsgRow.id) return;
+    const cleanDigits = userId.replace(/\D/g, '');
+    const candidateIds = Array.from(
+      new Set(
+        [
+          userId,
+          normalizedUserId,
+          cleanDigits.length >= 9 ? `user-${cleanDigits}` : null,
+          cleanDigits.length >= 9 ? cleanDigits : null,
+          cleanDigits.length >= 9 ? `+${cleanDigits}` : null,
+          'guest-buyer',
+        ].filter(Boolean) as string[]
+      )
+    );
 
-          const chatMsg: ChatMessage = {
-            id: newMsgRow.id,
-            senderId: newMsgRow.sender_id,
-            senderName: newMsgRow.sender_name,
-            text: newMsgRow.text || '',
-            imageUrl: newMsgRow.image_url || undefined,
-            timestamp: newMsgRow.timestamp || new Date().toISOString(),
-            isRead: Boolean(newMsgRow.is_read),
+    const isUserParticipant = (buyerId?: string, sellerId?: string, senderId?: string): boolean => {
+      if (!buyerId && !sellerId) return true;
+      return candidateIds.some(
+        (id) =>
+          (buyerId && normalizeUserId(buyerId) === id) ||
+          (sellerId && normalizeUserId(sellerId) === id) ||
+          (senderId && normalizeUserId(senderId) === id) ||
+          buyerId === id ||
+          sellerId === id ||
+          senderId === id
+      );
+    };
+
+    const processIncomingChatMessage = async (
+      chatMsg: ChatMessage,
+      conversationId: string,
+      fallbackConvData?: any
+    ) => {
+      const convs = getStoredConversations();
+      const convIndex = convs.findIndex((c) => c.id === conversationId);
+
+      if (convIndex >= 0) {
+        const conv = convs[convIndex];
+        // Ensure user is participant
+        if (!isUserParticipant(conv.buyerId, conv.sellerId, chatMsg.senderId)) {
+          return;
+        }
+
+        const existingMsgIndex = conv.messages.findIndex((m) => m.id === chatMsg.id);
+        let updatedMessages: ChatMessage[];
+        if (existingMsgIndex >= 0) {
+          updatedMessages = [...conv.messages];
+          updatedMessages[existingMsgIndex] = {
+            ...updatedMessages[existingMsgIndex],
+            ...chatMsg,
+          };
+        } else {
+          updatedMessages = deduplicateMessages([...conv.messages, chatMsg]);
+        }
+
+        const isIncoming = normalizeUserId(chatMsg.senderId) !== normalizedUserId;
+        const currentUnread = (conv.unreadCountForUser && conv.unreadCountForUser[normalizedUserId]) || 0;
+
+        const updated: Conversation = {
+          ...conv,
+          messages: updatedMessages,
+          lastMessageText: chatMsg.imageUrl && !chatMsg.text ? '📷 Сурат / Фото' : (chatMsg.text || conv.lastMessageText),
+          lastMessageTimestamp: chatMsg.timestamp,
+          unreadCountForUser: {
+            ...conv.unreadCountForUser,
+            [normalizedUserId]: isIncoming && !chatMsg.isRead && existingMsgIndex < 0 ? currentUnread + 1 : currentUnread,
+          },
+          updatedAt: chatMsg.timestamp,
+        };
+
+        const newConvs = [updated, ...convs.filter((c) => c.id !== conversationId)];
+        saveConversations(newConvs);
+      } else {
+        // Conversation not found locally - fetch from Supabase or use fallback
+        let remoteConv = fallbackConvData;
+        if (!remoteConv) {
+          const { data } = await supabase
+            .from('conversations')
+            .select('*')
+            .eq('id', conversationId)
+            .setHeader('x-user-id', normalizedUserId)
+            .maybeSingle();
+          remoteConv = data;
+        }
+
+        if (remoteConv && isUserParticipant(remoteConv.buyer_id || remoteConv.buyerId, remoteConv.seller_id || remoteConv.sellerId)) {
+          const freshConvs = getStoredConversations();
+          const existingIdx = freshConvs.findIndex((c) => c.id === remoteConv.id);
+          const builtConv: Conversation = {
+            id: remoteConv.id,
+            adId: remoteConv.ad_id || remoteConv.adId || 'ad',
+            adTitle: remoteConv.ad_title || remoteConv.adTitle || 'Эълон',
+            adPrice: Number(remoteConv.ad_price || remoteConv.adPrice || 0),
+            adImage: remoteConv.ad_image || remoteConv.adImage || '',
+            buyerId: remoteConv.buyer_id || remoteConv.buyerId,
+            buyerName: remoteConv.buyer_name || remoteConv.buyerName || 'Харидор',
+            sellerId: remoteConv.seller_id || remoteConv.sellerId,
+            sellerName: remoteConv.seller_name || remoteConv.sellerName || 'Фурӯшанда',
+            sellerPhone: remoteConv.seller_phone || remoteConv.sellerPhone || undefined,
+            messages: [chatMsg],
+            lastMessageText: chatMsg.imageUrl && !chatMsg.text ? '📷 Сурат / Фото' : (chatMsg.text || remoteConv.last_message_text || ''),
+            lastMessageTimestamp: chatMsg.timestamp,
+            unreadCountForUser: {
+              [remoteConv.buyer_id || remoteConv.buyerId]: normalizeUserId(chatMsg.senderId) === normalizeUserId(remoteConv.buyer_id || remoteConv.buyerId) ? 0 : 1,
+              [remoteConv.seller_id || remoteConv.sellerId]: normalizeUserId(chatMsg.senderId) === normalizeUserId(remoteConv.seller_id || remoteConv.sellerId) ? 0 : 1,
+            },
+            updatedAt: chatMsg.timestamp,
           };
 
-          // Update local conversation cache immediately
-          const convs = getStoredConversations();
-          const conv = convs.find((c) => c.id === newMsgRow.conversation_id);
-          if (conv) {
-            const existingMsgIndex = conv.messages.findIndex((m) => m.id === chatMsg.id);
-            let updatedMessages: ChatMessage[];
-            if (existingMsgIndex >= 0) {
-              updatedMessages = [...conv.messages];
-              updatedMessages[existingMsgIndex] = {
-                ...updatedMessages[existingMsgIndex],
-                ...chatMsg,
-              };
-            } else {
-              updatedMessages = deduplicateMessages([...conv.messages, chatMsg]);
-            }
-
-            const isIncoming = chatMsg.senderId !== userId;
-            const currentUnread = (conv.unreadCountForUser && conv.unreadCountForUser[userId]) || 0;
-
-            const updated = {
-              ...conv,
-              messages: updatedMessages,
-              lastMessageText: chatMsg.imageUrl && !chatMsg.text ? '📷 Сурат / Фото' : (chatMsg.text || conv.lastMessageText),
-              lastMessageTimestamp: chatMsg.timestamp,
-              unreadCountForUser: {
-                ...conv.unreadCountForUser,
-                [userId]: isIncoming && !chatMsg.isRead && existingMsgIndex < 0 ? currentUnread + 1 : currentUnread,
-              },
-              updatedAt: chatMsg.timestamp,
-            };
-            const newConvs = [updated, ...convs.filter((c) => c.id !== conv.id)];
-            saveConversations(newConvs);
+          if (existingIdx >= 0) {
+            freshConvs[existingIdx] = builtConv;
           } else {
-            // New conversation incoming from another phone/account!
-            const { data: remoteConv } = await supabase
-              .from('conversations')
-              .select('*')
-              .eq('id', newMsgRow.conversation_id)
-              .maybeSingle();
-
-            if (remoteConv) {
-              const freshConvs = getStoredConversations();
-              const existingIdx = freshConvs.findIndex((c) => c.id === remoteConv.id);
-              const builtConv: Conversation = {
-                id: remoteConv.id,
-                adId: remoteConv.ad_id,
-                adTitle: remoteConv.ad_title,
-                adPrice: Number(remoteConv.ad_price),
-                adImage: remoteConv.ad_image || '',
-                buyerId: remoteConv.buyer_id,
-                buyerName: remoteConv.buyer_name,
-                sellerId: remoteConv.seller_id,
-                sellerName: remoteConv.seller_name,
-                sellerPhone: remoteConv.seller_phone || undefined,
-                messages: [chatMsg],
-                lastMessageText: chatMsg.imageUrl && !chatMsg.text ? '📷 Сурат / Фото' : (chatMsg.text || remoteConv.last_message_text || ''),
-                lastMessageTimestamp: chatMsg.timestamp,
-                unreadCountForUser: {
-                  [remoteConv.buyer_id]: chatMsg.senderId === remoteConv.buyer_id ? 0 : 1,
-                  [remoteConv.seller_id]: chatMsg.senderId === remoteConv.seller_id ? 0 : 1,
-                },
-                updatedAt: chatMsg.timestamp,
-              };
-
-              if (existingIdx >= 0) {
-                freshConvs[existingIdx] = builtConv;
-              } else {
-                freshConvs.unshift(builtConv);
-              }
-              saveConversations(freshConvs);
-            } else {
-              await syncConversationsFromSupabase(userId);
-            }
+            freshConvs.unshift(builtConv);
           }
+          saveConversations(freshConvs);
+        } else {
+          await syncConversationsFromSupabase(userId);
+        }
+      }
 
-          onNewMessage(chatMsg, newMsgRow.conversation_id);
+      onNewMessage(chatMsg, conversationId);
+      if (onChatUpdate) onChatUpdate();
+    };
+
+    // Unique channel ID per subscriber with broadcast listener
+    const uniqueChannelName = `chat-live-${userId}-${Date.now().toString(36)}`;
+    const channel = supabase.channel(uniqueChannelName);
+
+    // 1. Fast Realtime Broadcast listener (sub-50ms cross-device delivery)
+    channel.on('broadcast', { event: 'new_message' }, async (payload: any) => {
+      const data = payload?.payload;
+      if (!data || !data.message || !data.conversationId) return;
+
+      if (!isUserParticipant(data.buyerId, data.sellerId, data.message.senderId)) {
+        return;
+      }
+
+      await processIncomingChatMessage(data.message, data.conversationId, data);
+    });
+
+    // 2. Postgres changes listener on messages table
+    channel.on(
+      'postgres_changes',
+      {
+        event: 'INSERT',
+        schema: 'public',
+        table: 'messages',
+      },
+      async (payload) => {
+        const newMsgRow = payload.new as any;
+        if (!newMsgRow || !newMsgRow.id) return;
+
+        const chatMsg: ChatMessage = {
+          id: newMsgRow.id,
+          senderId: newMsgRow.sender_id,
+          senderName: newMsgRow.sender_name,
+          text: newMsgRow.text || '',
+          imageUrl: newMsgRow.image_url || undefined,
+          timestamp: newMsgRow.timestamp || new Date().toISOString(),
+          isRead: Boolean(newMsgRow.is_read),
+        };
+
+        await processIncomingChatMessage(chatMsg, newMsgRow.conversation_id);
+      }
+    );
+
+    // 3. Postgres changes listener on conversations table
+    channel.on(
+      'postgres_changes',
+      {
+        event: '*',
+        schema: 'public',
+        table: 'conversations',
+      },
+      () => {
+        syncConversationsFromSupabase(userId).then(() => {
           if (onChatUpdate) onChatUpdate();
-        }
-      )
-      .on(
-        'postgres_changes',
-        {
-          event: '*',
-          schema: 'public',
-          table: 'conversations',
-        },
-        () => {
-          syncConversationsFromSupabase(userId).then(() => {
-            if (onChatUpdate) onChatUpdate();
-          });
-        }
-      )
-      .subscribe();
+        });
+      }
+    );
+
+    channel.subscribe();
 
     return () => {
-      supabase.removeChannel(channel);
+      try {
+        supabase.removeChannel(channel);
+      } catch {
+        // ignore
+      }
     };
   } catch (err) {
     console.warn('Realtime subscription failed:', err);
@@ -410,11 +503,12 @@ export function getOrCreateConversation(
   ad: ProductAd,
   currentUser: UserProfile | null
 ): Conversation {
-  const currentUserId = currentUser?.id || getDeviceGuestId();
+  const currentUserId = normalizeUserId(currentUser?.id || getDeviceGuestId());
   const currentUserName = currentUser?.name || 'Шумо (Харидор)';
-  const sellerId =
+  const sellerId = normalizeUserId(
     ad.sellerId ||
-    (ad.phone ? `user-${ad.phone.replace(/\D/g, '')}` : `seller-${ad.id}`);
+    (ad.phone ? `user-${ad.phone.replace(/\D/g, '')}` : `seller-${ad.id}`)
+  );
   const sellerName = ad.sellerName || 'Фурӯшанда';
 
   const convs = getStoredConversations();
@@ -423,8 +517,8 @@ export function getOrCreateConversation(
   let existing = convs.find(
     (c) =>
       c.adId === ad.id &&
-      ((c.buyerId === currentUserId && c.sellerId === sellerId) ||
-        (c.buyerId === sellerId && c.sellerId === currentUserId))
+      ((normalizeUserId(c.buyerId) === currentUserId && normalizeUserId(c.sellerId) === sellerId) ||
+        (normalizeUserId(c.buyerId) === sellerId && normalizeUserId(c.sellerId) === currentUserId))
   );
 
   // 2. If logged in and previous conversation was created as guest for this ad, adopt it
@@ -433,7 +527,7 @@ export function getOrCreateConversation(
       (c) =>
         c.adId === ad.id &&
         (c.buyerId === 'guest-buyer' || c.buyerId.startsWith('guest-')) &&
-        c.sellerId === sellerId
+        normalizeUserId(c.sellerId) === sellerId
     );
     if (existing) {
       existing.buyerId = currentUserId;
@@ -486,7 +580,7 @@ export function getOrCreateConversation(
   saveConversations(updatedConvs);
 
   // Asynchronously persist new conversation to Supabase if configured
-  const supabase = getSupabase();
+  const supabase = getSupabase(currentUserId);
   if (supabase) {
     supabase
       .from('conversations')
@@ -505,6 +599,7 @@ export function getOrCreateConversation(
         last_message_timestamp: newConv.lastMessageTimestamp,
         updated_at: newConv.updatedAt,
       })
+      .setHeader('x-user-id', currentUserId)
       .then(
         () => {},
         (e: any) => console.warn('Supabase conversation upsert error:', e)
@@ -515,7 +610,8 @@ export function getOrCreateConversation(
 }
 
 /**
- * Sends a message in a conversation with strict deduplication guards and synchronous debounce.
+ * Sends a message in a conversation with strict deduplication guards,
+ * instant local optimistic update, Supabase SQL persistence, and Realtime Broadcast.
  */
 export function sendMessage(
   conversationId: string,
@@ -526,7 +622,8 @@ export function sendMessage(
   const cleanText = text.trim();
   if (!cleanText && !imageUrl) return null;
 
-  const senderId = senderUser?.id || 'guest-buyer';
+  const rawSenderId = senderUser?.id || 'guest-buyer';
+  const senderId = normalizeUserId(rawSenderId);
   const now = Date.now();
   const sendKey = `${conversationId}:${senderId}:${cleanText || imageUrl}`;
 
@@ -545,11 +642,11 @@ export function sendMessage(
 
   const conv = convs[index];
   const senderName = senderUser?.name || 'Шумо';
-  const recipientId = senderId === conv.buyerId ? conv.sellerId : conv.buyerId;
+  const recipientId = senderId === normalizeUserId(conv.buyerId) ? normalizeUserId(conv.sellerId) : normalizeUserId(conv.buyerId);
 
   // Duplicate check within existing messages in this conversation
   const isDuplicateMessage = conv.messages.some((m) => {
-    if (m.senderId !== senderId) return false;
+    if (normalizeUserId(m.senderId) !== senderId) return false;
     if (imageUrl || m.imageUrl) return false;
     if (m.text?.trim() !== cleanText) return false;
     const diff = Math.abs(now - new Date(m.timestamp).getTime());
@@ -592,47 +689,74 @@ export function sendMessage(
   ];
   saveConversations(newConvs);
 
-  // Asynchronously send to shared Supabase backend if configured
-  const supabase = getSupabase();
+  // Asynchronously send to shared Supabase backend and Realtime broadcast
+  const supabase = getSupabase(senderId);
   if (supabase) {
     (async () => {
       try {
         // 1. Ensure conversation exists in remote table
-        const { error: convErr } = await supabase.from('conversations').upsert({
-          id: updatedConv.id,
-          ad_id: updatedConv.adId,
-          ad_title: updatedConv.adTitle,
-          ad_price: updatedConv.adPrice,
-          ad_image: updatedConv.adImage,
-          buyer_id: updatedConv.buyerId,
-          buyer_name: updatedConv.buyerName,
-          seller_id: updatedConv.sellerId,
-          seller_name: updatedConv.sellerName,
-          seller_phone: updatedConv.sellerPhone || '',
-          last_message_text: updatedConv.lastMessageText,
-          last_message_timestamp: updatedConv.lastMessageTimestamp,
-          updated_at: updatedConv.updatedAt,
-        });
+        const { error: convErr } = await supabase
+          .from('conversations')
+          .upsert({
+            id: updatedConv.id,
+            ad_id: updatedConv.adId,
+            ad_title: updatedConv.adTitle,
+            ad_price: updatedConv.adPrice,
+            ad_image: updatedConv.adImage,
+            buyer_id: updatedConv.buyerId,
+            buyer_name: updatedConv.buyerName,
+            seller_id: updatedConv.sellerId,
+            seller_name: updatedConv.sellerName,
+            seller_phone: updatedConv.sellerPhone || '',
+            last_message_text: updatedConv.lastMessageText,
+            last_message_timestamp: updatedConv.lastMessageTimestamp,
+            updated_at: updatedConv.updatedAt,
+          })
+          .setHeader('x-user-id', senderId);
 
         if (convErr) {
-          console.error('Supabase conversation upsert failed:', convErr);
+          console.warn('Supabase conversation upsert warning:', convErr);
         }
 
         // 2. Insert the message into messages table
-        const { error: msgErr } = await supabase.from('messages').insert({
-          id: newMsg.id,
-          conversation_id: conversationId,
-          sender_id: newMsg.senderId,
-          sender_name: newMsg.senderName,
-          text: newMsg.text,
-          image_url: newMsg.imageUrl || null,
-          timestamp: newMsg.timestamp,
-          is_read: false,
-        });
+        const { error: msgErr } = await supabase
+          .from('messages')
+          .insert({
+            id: newMsg.id,
+            conversation_id: conversationId,
+            sender_id: newMsg.senderId,
+            sender_name: newMsg.senderName,
+            text: newMsg.text,
+            image_url: newMsg.imageUrl || null,
+            timestamp: newMsg.timestamp,
+            is_read: false,
+          })
+          .setHeader('x-user-id', senderId);
 
         if (msgErr) {
-          console.error('Supabase message insert failed:', msgErr);
+          console.warn('Supabase message insert warning:', msgErr);
         }
+
+        // 3. Broadcast to all active devices in realtime via Supabase Realtime Broadcast
+        const broadcastChannel = supabase.channel(CHAT_BROADCAST_CHANNEL);
+        broadcastChannel.subscribe((status) => {
+          if (status === 'SUBSCRIBED') {
+            broadcastChannel.send({
+              type: 'broadcast',
+              event: 'new_message',
+              payload: {
+                conversationId: updatedConv.id,
+                buyerId: updatedConv.buyerId,
+                sellerId: updatedConv.sellerId,
+                message: newMsg,
+                adId: updatedConv.adId,
+                adTitle: updatedConv.adTitle,
+                adPrice: updatedConv.adPrice,
+                adImage: updatedConv.adImage,
+              },
+            });
+          }
+        });
       } catch (err: unknown) {
         console.warn('Supabase message sync error:', err);
       }

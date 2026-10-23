@@ -9,6 +9,7 @@ import {
   deduplicateMessages,
   syncConversationsFromSupabase,
   subscribeToLiveChat,
+  normalizeUserId,
   CHAT_EVENT_NAME,
 } from '../utils/chatUtils';
 import { isSupabaseConfigured } from '../utils/supabaseClient';
@@ -90,7 +91,7 @@ export const ChatModal: React.FC<ChatModalProps> = ({
       currentUserId,
       (newMsg, convId) => {
         setConversations(getStoredConversations());
-        if (convId === activeConversationId && newMsg.senderId !== currentUserId) {
+        if (convId === activeConversationId && normalizeUserId(newMsg.senderId) !== normalizeUserId(currentUserId)) {
           markConversationAsRead(convId, currentUserId);
         }
       },
@@ -118,7 +119,7 @@ export const ChatModal: React.FC<ChatModalProps> = ({
 
   const effectiveRole: 'buyer' | 'seller' = activeRoleOverride
     ? activeRoleOverride
-    : currentConv && currentConv.sellerId === currentUserId
+    : currentConv && normalizeUserId(currentConv.sellerId) === normalizeUserId(currentUserId)
     ? 'seller'
     : 'buyer';
 
@@ -153,18 +154,19 @@ export const ChatModal: React.FC<ChatModalProps> = ({
 
   // Filter conversations
   const filteredConversations = conversations.filter((c) => {
-    // Only show conversations where user is buyer or seller
+    const normEffective = normalizeUserId(effectiveUserId);
+    const normCurrent = normalizeUserId(currentUserId);
     const isParticipant =
-      c.buyerId === effectiveUserId ||
-      c.sellerId === effectiveUserId ||
-      c.buyerId === currentUserId ||
-      c.sellerId === currentUserId ||
+      normalizeUserId(c.buyerId) === normEffective ||
+      normalizeUserId(c.sellerId) === normEffective ||
+      normalizeUserId(c.buyerId) === normCurrent ||
+      normalizeUserId(c.sellerId) === normCurrent ||
       currentUserId === 'guest-buyer';
     if (!isParticipant) return false;
 
     // Tabs filter
-    if (activeTab === 'buying' && c.buyerId !== effectiveUserId && c.buyerId !== currentUserId) return false;
-    if (activeTab === 'selling' && c.sellerId !== effectiveUserId && c.sellerId !== currentUserId) return false;
+    if (activeTab === 'buying' && normalizeUserId(c.buyerId) !== normEffective && normalizeUserId(c.buyerId) !== normCurrent) return false;
+    if (activeTab === 'selling' && normalizeUserId(c.sellerId) !== normEffective && normalizeUserId(c.sellerId) !== normCurrent) return false;
 
     // Search query
     if (chatSearch.trim()) {

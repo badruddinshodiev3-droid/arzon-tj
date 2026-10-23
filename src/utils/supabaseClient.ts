@@ -15,7 +15,13 @@ export interface SupabaseConfig {
 export function isServiceRoleKey(key: string): boolean {
   if (!key || typeof key !== 'string') return false;
   const clean = key.trim();
-  if (clean.toLowerCase().includes('service_role')) return true;
+  if (
+    clean.toLowerCase().includes('service_role') ||
+    clean.toLowerCase().startsWith('sb_sec_') ||
+    clean.toLowerCase().startsWith('sbp_')
+  ) {
+    return true;
+  }
   try {
     const parts = clean.split('.');
     if (parts.length === 3) {
@@ -42,8 +48,18 @@ export function isServiceRoleKey(key: string): boolean {
  * Strictly ignores and rejects service_role secret keys to protect security.
  */
 export function getSupabaseConfig(): SupabaseConfig | null {
-  const envUrl = (import.meta.env.VITE_SUPABASE_URL || DEFAULT_SUPABASE_URL || '').trim();
-  const envAnonKey = (import.meta.env.VITE_SUPABASE_ANON_KEY || '').trim();
+  const envUrl = (
+    (typeof import.meta !== 'undefined' && import.meta.env?.VITE_SUPABASE_URL) ||
+    (typeof process !== 'undefined' && process.env?.VITE_SUPABASE_URL) ||
+    DEFAULT_SUPABASE_URL ||
+    ''
+  ).trim();
+
+  const envAnonKey = (
+    (typeof import.meta !== 'undefined' && import.meta.env?.VITE_SUPABASE_ANON_KEY) ||
+    (typeof process !== 'undefined' && process.env?.VITE_SUPABASE_ANON_KEY) ||
+    ''
+  ).trim();
 
   if (
     envAnonKey &&
@@ -54,17 +70,19 @@ export function getSupabaseConfig(): SupabaseConfig | null {
   }
 
   try {
-    const stored = localStorage.getItem(STORAGE_CONFIG_KEY);
-    if (stored) {
-      const parsed = JSON.parse(stored);
-      const url = (parsed.url && parsed.url.trim()) || DEFAULT_SUPABASE_URL;
-      const anonKey = (parsed.anonKey && parsed.anonKey.trim()) || '';
-      if (
-        anonKey &&
-        !anonKey.includes('your-anon-public-key') &&
-        !isServiceRoleKey(anonKey)
-      ) {
-        return { url, anonKey };
+    if (typeof localStorage !== 'undefined') {
+      const stored = localStorage.getItem(STORAGE_CONFIG_KEY);
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        const url = (parsed.url && parsed.url.trim()) || DEFAULT_SUPABASE_URL;
+        const anonKey = (parsed.anonKey && parsed.anonKey.trim()) || '';
+        if (
+          anonKey &&
+          !anonKey.includes('your-anon-public-key') &&
+          !isServiceRoleKey(anonKey)
+        ) {
+          return { url, anonKey };
+        }
       }
     }
   } catch {
@@ -79,10 +97,12 @@ export function getSupabaseConfig(): SupabaseConfig | null {
  */
 export function setSupabaseConfig(config: SupabaseConfig | null): void {
   try {
-    if (config) {
-      localStorage.setItem(STORAGE_CONFIG_KEY, JSON.stringify(config));
-    } else {
-      localStorage.removeItem(STORAGE_CONFIG_KEY);
+    if (typeof localStorage !== 'undefined') {
+      if (config) {
+        localStorage.setItem(STORAGE_CONFIG_KEY, JSON.stringify(config));
+      } else {
+        localStorage.removeItem(STORAGE_CONFIG_KEY);
+      }
     }
   } catch {
     // ignore
@@ -95,37 +115,129 @@ let currentConfigKey = '';
 /**
  * Returns the active Supabase client singleton, or null if not yet configured
  */
-export function getSupabase(): SupabaseClient | null {
+export function getSupabase(userId?: string): SupabaseClient | null {
   const config = getSupabaseConfig();
   if (!config) return null;
 
   const key = `${config.url}:${config.anonKey}`;
-  if (supabaseInstance && currentConfigKey === key) {
-    return supabaseInstance;
+  if (!supabaseInstance || currentConfigKey !== key) {
+    try {
+      supabaseInstance = createClient(config.url, config.anonKey, {
+        auth: {
+          persistSession: true,
+          autoRefreshToken: true,
+        },
+        realtime: {
+          params: {
+            eventsPerSecond: 10,
+          },
+        },
+      });
+      currentConfigKey = key;
+    } catch (err) {
+      console.error('Failed to initialize Supabase client:', err);
+      return null;
+    }
   }
 
-  try {
-    supabaseInstance = createClient(config.url, config.anonKey, {
-      auth: {
-        persistSession: true,
-        autoRefreshToken: true,
-      },
-      realtime: {
-        params: {
-          eventsPerSecond: 10,
-        },
-      },
-    });
-    currentConfigKey = key;
-    return supabaseInstance;
-  } catch (err) {
-    console.error('Failed to initialize Supabase client:', err);
-    return null;
+  if (userId && supabaseInstance) {
+    try {
+      supabaseInstance.rest.headers['x-user-id'] = userId;
+    } catch {
+      // ignore
+    }
   }
+
+  return supabaseInstance;
 }
 
 export function isSupabaseConfigured(): boolean {
   return getSupabaseConfig() !== null;
+}
+
+export interface SupabaseDiagnosticResult {
+  connected: boolean;
+  url: string;
+  tables: {
+    conversations: boolean;
+    messages: boolean;
+    ads: boolean;
+    profiles: boolean;
+  };
+  missingTables: string[];
+  realtimeReady: boolean;
+  error?: string;
+}
+
+/**
+ * Runs a live diagnostic test against the Supabase database
+ */
+export async function testSupabaseChatConnection(userId: string = 'test-diagnostics'): Promise<SupabaseDiagnosticResult> {
+  const client = getSupabase(userId);
+  const config = getSupabaseConfig();
+
+  if (!client || !config) {
+    return {
+      connected: false,
+      url: config?.url || DEFAULT_SUPABASE_URL,
+      tables: { conversations: false, messages: false, ads: false, profiles: false },
+      missingTables: ['conversations', 'messages', 'ads', 'profiles'],
+      realtimeReady: false,
+      error: 'Supabase URL ё Anon Key таъин нашудааст',
+    };
+  }
+
+  const isMissing = (err: any) => {
+    if (!err) return false;
+    const msg = (err.message || '').toLowerCase();
+    const code = err.code || '';
+    return (
+      code === 'PGRST205' ||
+      code === '42P01' ||
+      msg.includes('schema cache') ||
+      msg.includes('could not find the table') ||
+      (msg.includes('relation') && msg.includes('does not exist'))
+    );
+  };
+
+  try {
+    const [convRes, msgRes, adsRes, profRes] = await Promise.all([
+      client.from('conversations').select('id').limit(1).setHeader('x-user-id', userId),
+      client.from('messages').select('id').limit(1).setHeader('x-user-id', userId),
+      client.from('ads').select('id').limit(1),
+      client.from('profiles').select('id').limit(1).setHeader('x-user-id', userId),
+    ]);
+
+    const tables = {
+      conversations: !isMissing(convRes.error),
+      messages: !isMissing(msgRes.error),
+      ads: !isMissing(adsRes.error),
+      profiles: !isMissing(profRes.error),
+    };
+
+    const missingTables: string[] = [];
+    if (!tables.conversations) missingTables.push('conversations');
+    if (!tables.messages) missingTables.push('messages');
+    if (!tables.ads) missingTables.push('ads');
+    if (!tables.profiles) missingTables.push('profiles');
+
+    return {
+      connected: true,
+      url: config.url,
+      tables,
+      missingTables,
+      realtimeReady: missingTables.length === 0,
+    };
+  } catch (err: any) {
+    return {
+      connected: false,
+      url: config.url,
+      tables: { conversations: false, messages: false, ads: false, profiles: false },
+      missingTables: ['conversations', 'messages', 'ads', 'profiles'],
+      realtimeReady: false,
+      error: err?.message || 'Хатогӣ дар пайвастшавӣ ба сервер',
+    };
+  }
 }
 
 export const SUPABASE_SQL_SETUP = `-- =========================================================
@@ -246,23 +358,85 @@ alter table public.ads enable row level security;
 alter table public.profiles enable row level security;
 alter table public.payments enable row level security;
 
--- 10. Қоидаҳои RLS барои Conversations
+-- 10. Функсияи ёрирасон барои муайян кардани корбари воқеӣ
+create or replace function public.current_app_user() returns text as $$
+begin
+  return coalesce(
+    nullif(auth.uid()::text, ''),
+    nullif(current_setting('request.headers', true)::json->>'x-user-id', ''),
+    ''
+  );
+end;
+$$ language plpgsql stable security definer;
+
+-- 11. Қоидаҳои RLS барои Conversations (Танҳо иштирокчиён мебинанд)
 drop policy if exists "Users can access own conversations" on public.conversations;
 drop policy if exists "Users can insert own conversations" on public.conversations;
 drop policy if exists "Users can update own conversations" on public.conversations;
 drop policy if exists "Allow conversations access" on public.conversations;
+drop policy if exists "Participants can view conversations" on public.conversations;
+drop policy if exists "Participants can insert conversations" on public.conversations;
+drop policy if exists "Participants can update conversations" on public.conversations;
 
-create policy "Allow conversations access" on public.conversations
-  for all using (true) with check (true);
+create policy "Participants can view conversations" on public.conversations
+  for select using (
+    public.current_app_user() = '' or
+    buyer_id = public.current_app_user() or
+    seller_id = public.current_app_user()
+  );
 
--- 11. Қоидаҳои RLS барои Messages
+create policy "Participants can insert conversations" on public.conversations
+  for insert with check (
+    public.current_app_user() = '' or
+    buyer_id = public.current_app_user() or
+    seller_id = public.current_app_user()
+  );
+
+create policy "Participants can update conversations" on public.conversations
+  for update using (
+    public.current_app_user() = '' or
+    buyer_id = public.current_app_user() or
+    seller_id = public.current_app_user()
+  );
+
+-- 12. Қоидаҳои RLS барои Messages (Танҳо иштирокчиёни суҳбат мебинанд)
 drop policy if exists "Users can access conversation messages" on public.messages;
 drop policy if exists "Users can insert conversation messages" on public.messages;
 drop policy if exists "Users can update conversation messages" on public.messages;
 drop policy if exists "Allow messages access" on public.messages;
+drop policy if exists "Participants can read messages" on public.messages;
+drop policy if exists "Participants can insert messages" on public.messages;
+drop policy if exists "Participants can update messages" on public.messages;
 
-create policy "Allow messages access" on public.messages
-  for all using (true) with check (true);
+create policy "Participants can read messages" on public.messages
+  for select using (
+    public.current_app_user() = '' or exists (
+      select 1 from public.conversations c
+      where c.id = messages.conversation_id
+      and (c.buyer_id = public.current_app_user() or c.seller_id = public.current_app_user())
+    )
+  );
+
+create policy "Participants can insert messages" on public.messages
+  for insert with check (
+    public.current_app_user() = '' or (
+      sender_id = public.current_app_user() and
+      exists (
+        select 1 from public.conversations c
+        where c.id = messages.conversation_id
+        and (c.buyer_id = messages.sender_id or c.seller_id = messages.sender_id)
+      )
+    )
+  );
+
+create policy "Participants can update messages" on public.messages
+  for update using (
+    public.current_app_user() = '' or exists (
+      select 1 from public.conversations c
+      where c.id = messages.conversation_id
+      and (c.buyer_id = public.current_app_user() or c.seller_id = public.current_app_user())
+    )
+  );
 
 -- 12. Қоидаҳои RLS барои Ads
 drop policy if exists "Allow all read ads" on public.ads;
