@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#059669"/>
+      <stop offset="50%" stop-color="#10b981"/>
+      <stop offset="100%" stop-color="#0d9488"/>
+    </linearGradient>
+    <linearGradient id="gold" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#fef08a"/>
+      <stop offset="100%" stop-color="#eab308"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="128" fill="url(#bg)"/>
+  <circle cx="256" cy="256" r="180" fill="none" stroke="white" stroke-width="12" opacity="0.25"/>
+  <!-- Stylized Letter A with crown/star apex -->
+  <path d="M256 100 L370 390 L305 390 L280 320 L232 320 L207 390 L142 390 Z M256 210 L242 270 L270 270 Z" fill="#ffffff"/>
+  <!-- Gold Accent Dot / Somoni Crest -->
+  <circle cx="256" cy="85" r="18" fill="url(#gold)"/>
+</svg>

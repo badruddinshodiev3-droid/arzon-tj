@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Arzon.tj</string>
+    <string name="title_activity_main">Arzon.tj</string>
+    <string name="package_name">tj.arzon.app</string>
+    <string name="custom_url_scheme">tj.arzon.app</string>
+</resources>

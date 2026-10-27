@@ -1,0 +1,53 @@
+@import "tailwindcss";
+
+/* Universal Box-Sizing & Mobile Responsive Guardrails */
+*, *::before, *::after {
+  box-sizing: border-box;
+}
+
+html {
+  width: 100%;
+  max-width: 100%;
+  overflow-x: hidden;
+  -webkit-text-size-adjust: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  width: 100%;
+  max-width: 100%;
+  overflow-x: hidden;
+  position: relative;
+  margin: 0;
+  padding: 0;
+}
+
+#root {
+  width: 100%;
+  max-width: 100%;
+  overflow-x: hidden;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Ensure images and media never overflow screen width */
+img, svg, video, canvas, audio, iframe, embed, object {
+  max-width: 100%;
+  height: auto;
+}
+
+/* Safe area padding for mobile notches and bottom home indicator */
+.safe-area-pb {
+  padding-bottom: calc(0.5rem + env(safe-area-inset-bottom, 0px));
+}
+
+/* Hide scrollbar while preserving smooth horizontal scroll */
+.scrollbar-none::-webkit-scrollbar {
+  display: none;
+}
+.scrollbar-none {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
