@@ -11,7 +11,8 @@
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
     "cap:sync": "cap sync android",
-    "cap:build": "vite build && cap sync android"
+    "cap:build": "vite build && cap sync android",
+    "sync:github": "bash scripts/push-to-github.sh"
   },
   "dependencies": {
     "@capacitor/android": "^8.5.3",
