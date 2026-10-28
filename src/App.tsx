@@ -378,6 +378,14 @@ export default function App() {
         return;
       }
 
+      if (event === 'PASSWORD_RECOVERY') {
+        setToastMessage(
+          language === 'tg'
+            ? 'Истиноди барқарорсозии парол қабул шуд. Лутфан пароли навро дар танзимот гузоред.'
+            : 'Ссылка для сброса пароля принята.'
+        );
+      }
+
       if (session?.user && (event === 'SIGNED_IN' || event === 'INITIAL_SESSION' || event === 'USER_UPDATED')) {
         await syncUserProfileFromAuth(session.user);
       }

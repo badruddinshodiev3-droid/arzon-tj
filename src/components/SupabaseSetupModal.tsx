@@ -429,6 +429,23 @@ export const SupabaseSetupModal: React.FC<SupabaseSetupModalProps> = ({
             </div>
           </form>
 
+          {/* Email Rate Limit & Confirm Email Guide */}
+          <div className="p-3 bg-emerald-50/80 border border-emerald-200 rounded-2xl text-xs space-y-1.5 text-emerald-950">
+            <div className="flex items-center gap-1.5 font-bold text-emerald-900">
+              <Zap className="w-4 h-4 text-emerald-600 shrink-0" />
+              <span>
+                {language === 'tg'
+                  ? 'Танзими бақайдгирии Email ва пешгирии хатои 429 (Rate Limit):'
+                  : 'Настройка Email регистрации и предотвращение ошибки 429:'}
+              </span>
+            </div>
+            <p className="text-[11px] text-slate-700 leading-relaxed">
+              {language === 'tg'
+                ? 'Дар панели Supabase -> Authentication -> Providers -> Email тавсия мешавад интихоби «Confirm email»-ро хомӯш (OFF) кунед. Ин имкон медиҳад, ки корбарони APK ва веб фавран дар 1 сония бидуни маҳдудияти 3-4 мактуб дар як соат бақайд гирифта шаванд.'
+                : 'В Supabase -> Auth -> Providers -> Email рекомендуется отключить «Confirm email» для мгновенной регистрации пользователей без почтовых лимитов.'}
+            </p>
+          </div>
+
           {/* SQL Setup Script Section */}
           <div className="pt-2 border-t border-slate-200 space-y-2">
             <div className="flex items-center justify-between">

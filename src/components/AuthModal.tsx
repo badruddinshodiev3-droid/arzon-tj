@@ -165,6 +165,13 @@ export const AuthModal: React.FC<AuthModalProps> = ({
   const [isEmailLoading, setIsEmailLoading] = useState(false);
   const [emailError, setEmailError] = useState<string | null>(null);
   const [emailSuccessMsg, setEmailSuccessMsg] = useState<string | null>(null);
+  const [rateLimitDetail, setRateLimitDetail] = useState<{
+    isRateLimited: boolean;
+    reason: string;
+    actionableGuide: string;
+    accountCreated: boolean;
+  } | null>(null);
+  const [emailCooldown, setEmailCooldown] = useState<number>(0);
 
   // Profile View tabs
   const [profileTab, setProfileTab] = useState<ProfileSectionTab>('ads');
@@ -221,6 +228,14 @@ export const AuthModal: React.FC<AuthModalProps> = ({
     }
     return () => clearInterval(interval);
   }, [step, timer]);
+
+  useEffect(() => {
+    let interval: NodeJS.Timeout;
+    if (emailCooldown > 0) {
+      interval = setInterval(() => setEmailCooldown((prev) => prev - 1), 1000);
+    }
+    return () => clearInterval(interval);
+  }, [emailCooldown]);
 
   useEffect(() => {
     if (currentUser) {
@@ -335,8 +350,11 @@ export const AuthModal: React.FC<AuthModalProps> = ({
   // Real Supabase Email Auth flow (Sign Up, Sign In, Password Reset)
   const handleEmailAuth = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (isEmailLoading || emailCooldown > 0) return;
+
     setEmailError(null);
     setEmailSuccessMsg(null);
+    setRateLimitDetail(null);
 
     const cleanEmail = email.trim().toLowerCase();
     if (!cleanEmail.includes('@') || !cleanEmail.includes('.')) {
@@ -355,9 +373,43 @@ export const AuthModal: React.FC<AuthModalProps> = ({
     try {
       // 1. Password Reset Request
       if (showForgotPassword) {
-        const { error: resetErr } = await supabase.auth.resetPasswordForEmail(cleanEmail);
+        const { error: resetErr } = await supabase.auth.resetPasswordForEmail(cleanEmail, {
+          redirectTo: typeof window !== 'undefined' ? window.location.origin : undefined,
+        });
         if (resetErr) {
-          setEmailError(resetErr.message);
+          const isRateLimit =
+            resetErr.message.toLowerCase().includes('rate limit') ||
+            (resetErr as any).status === 429 ||
+            (resetErr as any).code === 'over_email_send_rate_limit';
+
+          if (isRateLimit) {
+            setEmailCooldown(30);
+            setRateLimitDetail({
+              isRateLimited: true,
+              accountCreated: true,
+              reason:
+                language === 'tg'
+                  ? 'Маҳдудияти ирсоли мактуби Supabase: Хизматрасонии стандартии почтаи Supabase дар 1 соат танҳо 3-4 мактуб мефиристад ва лимити ин соат ба охир расидааст.'
+                  : 'Превышен лимит отправки писем Supabase (3-4 письма в час).',
+              actionableGuide:
+                language === 'tg'
+                  ? 'Дар панели Supabase -> Authentication -> SMTP Settings сервери SMTP-ро фаъол кунед, ё пас аз гузаштани як соат кӯшиш кунед.'
+                  : 'Настройте Custom SMTP в панели Supabase или повторите через час.',
+            });
+            setEmailError(
+              language === 'tg'
+                ? 'Маҳдудияти ирсоли почта (Email Rate Limit Exceeded). Лутфан дастури зеринро хонед.'
+                : 'Лимит отправки писем превышен. Пожалуйста, подождите.'
+            );
+          } else if (resetErr.message.toLowerCase().includes('user not found')) {
+            setEmailError(
+              language === 'tg'
+                ? 'Ҳисоб бо ин Email ёфт нашуд. Лутфан суроғаро дуруст ворид кунед.'
+                : 'Пользователь с таким Email не найден.'
+            );
+          } else {
+            setEmailError(resetErr.message);
+          }
         } else {
           setEmailSuccessMsg(
             language === 'tg'
@@ -388,20 +440,121 @@ export const AuthModal: React.FC<AuthModalProps> = ({
               name: fullName.trim() || cleanEmail.split('@')[0],
               phone: cleanPhoneNum,
             },
+            emailRedirectTo: typeof window !== 'undefined' ? window.location.origin : undefined,
           },
         });
 
         if (signUpErr) {
-          if (signUpErr.message.toLowerCase().includes('already registered')) {
+          const isRateLimit =
+            signUpErr.message.toLowerCase().includes('rate limit') ||
+            (signUpErr as any).status === 429 ||
+            (signUpErr as any).code === 'over_email_send_rate_limit';
+
+          if (isRateLimit) {
+            setEmailCooldown(30);
+
+            // Check if user was already registered earlier and credentials are correct
+            try {
+              const { data: trySignIn, error: trySignInErr } = await supabase.auth.signInWithPassword({
+                email: cleanEmail,
+                password: password,
+              });
+
+              if (trySignIn?.user) {
+                // User is already registered and credentials match! Log them in!
+                let displayName =
+                  trySignIn.user.user_metadata?.name ||
+                  fullName.trim() ||
+                  cleanEmail.split('@')[0] ||
+                  'Корбари Arzon.tj';
+                let userPhone = trySignIn.user.user_metadata?.phone || cleanPhoneNum || '+992 90 000 0000';
+                let balance = 30;
+
+                try {
+                  const { data: prof } = await supabase
+                    .from('profiles')
+                    .select('*')
+                    .eq('id', trySignIn.user.id)
+                    .maybeSingle();
+                  if (prof) {
+                    if (prof.name) displayName = prof.name;
+                    if (prof.phone) userPhone = prof.phone;
+                    if (typeof prof.balance === 'number') balance = prof.balance;
+                  }
+                } catch {
+                  // ignore
+                }
+
+                const authUser: UserProfile = {
+                  id: trySignIn.user.id,
+                  name: displayName,
+                  email: cleanEmail,
+                  phone: userPhone,
+                  balance,
+                  joinedDate: '2026',
+                  isVerified: true,
+                  rating: 5.0,
+                  reviewsCount: 1,
+                };
+
+                onLoginSuccess(authUser);
+                onClose();
+                return;
+              } else if (trySignInErr?.message?.toLowerCase().includes('email not confirmed')) {
+                setRateLimitDetail({
+                  isRateLimited: true,
+                  accountCreated: true,
+                  reason:
+                    language === 'tg'
+                      ? 'Ҳисоби шумо дар база сохта шудааст, аммо тасдиқи почтаро интизор аст. Азбаски маҳдудияти ирсоли мактуби Supabase (3-4 мактуб дар як соат) ба охир расидааст, мактуб дертар мерасад.'
+                      : 'Аккаунт создан, но ожидает подтверждения. Лимит отправки писем Supabase исчерпан.',
+                  actionableGuide:
+                    language === 'tg'
+                      ? 'Барои дастрасии фаврӣ бе ниёз ба мактуб: Дар панели Supabase -> Authentication -> Providers -> Email интихоби «Confirm email»-ро хомӯш (OFF) кунед.'
+                      : 'В панели Supabase -> Auth -> Providers -> Email отключите «Confirm email».',
+                });
+                setEmailError(
+                  language === 'tg'
+                    ? 'Ҳисоб мавҷуд аст, аммо тасдиқи Email-ро интизор аст (Email Rate Limit).'
+                    : 'Email не подтвержден из-за лимита писем Supabase.'
+                );
+                return;
+              }
+            } catch {
+              // ignore
+            }
+
+            // User is not yet registered, and Supabase refused to send confirmation email
+            setRateLimitDetail({
+              isRateLimited: true,
+              accountCreated: false,
+              reason:
+                language === 'tg'
+                  ? 'Сервери дохилии Supabase Auth (дар тарофаи ройгон) дар як соат танҳо ба 3-4 мактуб иҷозат медиҳад. Ин маҳдудият айни замон пур шудааст ва бинобар ин Supabase мактуби тасдиқро нафиристод ва сабти ҳисобро боздошт.'
+                  : 'Встроенный почтовый сервис Supabase ограничен 3-4 письмами в час. Лимит на этот час исчерпан.',
+              actionableGuide:
+                language === 'tg'
+                  ? 'Роҳи ҳалли фаврӣ: Дар панели идоракунии Supabase (supabase.com) -> Authentication -> Providers -> Email интихоби «Confirm email»-ро хомӯш (OFF) кунед. Баъд аз ин ҳамаи корбарон дар 1 сония ва бидуни ниёз ба мактуб сабти ном мешаванд!'
+                  : 'Решение: В Supabase Dashboard -> Auth -> Providers -> Email отключите «Confirm email».',
+            });
+
+            setEmailError(
+              language === 'tg'
+                ? 'Маҳдудияти ирсоли мактуби Supabase (email rate limit exceeded).'
+                : 'Лимит отправки писем Supabase превышен (email rate limit exceeded).'
+            );
+            return;
+          } else if (signUpErr.message.toLowerCase().includes('already registered')) {
             setEmailError(
               language === 'tg'
                 ? 'Ин Email аллакай сабт шудааст. Лутфан ворид шавед ё паролро барқарор кунед.'
                 : 'Этот Email уже зарегистрирован. Пожалуйста, войдите в аккаунт.'
             );
+            return;
           } else {
             setEmailError(signUpErr.message);
+            return;
           }
-          return;
         }
 
         if (signUpData.session && signUpData.user) {
@@ -462,14 +615,26 @@ export const AuthModal: React.FC<AuthModalProps> = ({
         ) {
           setEmailError(
             language === 'tg'
-              ? 'Email ё парол нодуруст аст. Агар ҳисоб надошта бошед, бақайдгирии навро интихоб кунед.'
+              ? 'Email ё парол нодуруст аст. Агар ҳисоб надошта бошед, «Бақайдгирии нав»-ро интихоб кунед.'
               : 'Неверный email или пароль. Если у вас нет аккаунта, зарегистрируйтесь.'
           );
         } else if (signInErr.message.toLowerCase().includes('email not confirmed')) {
+          setRateLimitDetail({
+            isRateLimited: true,
+            accountCreated: true,
+            reason:
+              language === 'tg'
+                ? 'Ин ҳисоб сабт шудааст, аммо тасдиқи суроғаи Email-ро интизор аст. Азбаски маҳдудияти 3-4 мактуб дар як соат дар Supabase пур шудааст, мактуб ба шумо нарасидааст.'
+                : 'Email не подтвержден. Лимит отправки писем Supabase исчерпан.',
+            actionableGuide:
+              language === 'tg'
+                ? 'Дар панели Supabase -> Authentication -> Providers -> Email интихоби «Confirm email»-ро хомӯш (OFF) намоед, то корбарон бидуни интизории мактуб ворид шаванд.'
+                : 'В панели Supabase -> Auth -> Providers -> Email выключите «Confirm email».',
+          });
           setEmailError(
             language === 'tg'
-              ? 'Email тасдиқ нашудааст. Лутфан ба почтаатон даромада истиноди тасдиқро пахш намоед.'
-              : 'Email не подтвержден. Пожалуйста, подтвердите почту по ссылке из письма.'
+              ? 'Email тасдиқ нашудааст. Лутфан тавсияи зеринро мутолиа кунед.'
+              : 'Email не подтвержден. Пожалуйста, подтвердите почту.'
           );
         } else {
           setEmailError(signInErr.message);
@@ -1988,9 +2153,76 @@ export const AuthModal: React.FC<AuthModalProps> = ({
             {authMethod === 'email' && (
               <form onSubmit={handleEmailAuth} className="space-y-4">
                 {emailError && (
-                  <div className="p-3 bg-rose-50 border border-rose-200 rounded-xl text-xs text-rose-700 flex items-center gap-2">
-                    <AlertTriangle className="w-4 h-4 shrink-0 text-rose-600" />
-                    <span>{emailError}</span>
+                  <div className="p-3 bg-rose-50 border border-rose-200 rounded-xl text-xs text-rose-700 flex items-start gap-2">
+                    <AlertTriangle className="w-4 h-4 shrink-0 text-rose-600 mt-0.5" />
+                    <span className="leading-relaxed">{emailError}</span>
+                  </div>
+                )}
+
+                {rateLimitDetail && (
+                  <div className="p-3.5 bg-amber-50/95 border border-amber-300 rounded-2xl text-xs text-amber-950 space-y-2.5 animate-in fade-in shadow-xs">
+                    <div className="flex items-center gap-2 font-bold text-amber-900">
+                      <Zap className="w-4 h-4 text-amber-600 shrink-0" />
+                      <span>
+                        {language === 'tg'
+                          ? 'Ташхиси маҳдудияти Supabase (Email Rate Limit):'
+                          : 'Диагностика лимита Supabase (Email Rate Limit):'}
+                      </span>
+                    </div>
+
+                    <div className="text-[11px] leading-relaxed text-amber-950 space-y-1">
+                      <p>
+                        <strong>{language === 'tg' ? '• Сабаб:' : '• Причина:'}</strong>{' '}
+                        {rateLimitDetail.reason}
+                      </p>
+                      <p>
+                        <strong>{language === 'tg' ? '• Оё мактуб фиристода шуд?' : '• Отправлено ли письмо?'}</strong>{' '}
+                        {language === 'tg'
+                          ? 'Не, аз сабаби пур шудани лимит, сервери Supabase мактубро нафиристод.'
+                          : 'Нет, из-за превышения лимита письмо не было отправлено.'}
+                      </p>
+                      <p>
+                        <strong>{language === 'tg' ? '• Ҳолати ҳисоб:' : '• Статус аккаунта:'}</strong>{' '}
+                        {rateLimitDetail.accountCreated
+                          ? language === 'tg'
+                            ? 'Ҳисоб дар база сабт аст, аммо тасдиқи почтаро интизор аст.'
+                            : 'Аккаунт существует, но требует подтверждения.'
+                          : language === 'tg'
+                          ? 'Ҳисоб ҳанӯз пурра тасдиқ/сохта нашудааст (транзаксия аз ҷониби Supabase боздошта шуд).'
+                          : 'Аккаунт еще не создан (транзакция прервана Supabase).'}
+                      </p>
+                    </div>
+
+                    <div className="p-2.5 bg-white/90 rounded-xl border border-amber-200 text-[11px] space-y-1">
+                      <strong className="text-amber-950 font-bold block">
+                        {language === 'tg' ? '🛠️ Роҳи ҳал дар панели Supabase (1 дақиқа):' : '🛠️ Решение в панели Supabase (1 минута):'}
+                      </strong>
+                      <p className="text-slate-700 leading-snug">
+                        {rateLimitDetail.actionableGuide}
+                      </p>
+                    </div>
+
+                    <div className="flex items-center gap-2 pt-1 flex-wrap">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setIsRegister(false);
+                          setRateLimitDetail(null);
+                          setEmailError(null);
+                        }}
+                        className="px-2.5 py-1.5 bg-amber-200 hover:bg-amber-300 text-amber-950 rounded-lg font-bold text-[11px] transition-colors cursor-pointer"
+                      >
+                        {language === 'tg' ? 'Воридшавӣ (Sign In)' : 'Войти в аккаунт'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={handleGooglePlayReviewLogin}
+                        className="px-2.5 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg font-bold text-[11px] transition-colors cursor-pointer flex items-center gap-1"
+                      >
+                        <ShieldCheck className="w-3.5 h-3.5" />
+                        <span>{language === 'tg' ? 'Ҳисоби санҷишӣ (1-Click)' : 'Тестовый аккаунт'}</span>
+                      </button>
+                    </div>
                   </div>
                 )}
 
@@ -2101,6 +2333,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                         setIsRegister(!isRegister);
                         setEmailError(null);
                         setEmailSuccessMsg(null);
+                        setRateLimitDetail(null);
                       }}
                       className="text-emerald-700 font-bold hover:underline cursor-pointer"
                     >
@@ -2117,7 +2350,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
 
                 <button
                   type="submit"
-                  disabled={isEmailLoading}
+                  disabled={isEmailLoading || emailCooldown > 0}
                   className="w-full py-2.5 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white font-bold text-xs rounded-xl shadow-xs transition-colors cursor-pointer flex items-center justify-center gap-2"
                 >
                   {isEmailLoading ? (
@@ -2125,6 +2358,12 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                       <RefreshCw className="w-3.5 h-3.5 animate-spin" />
                       <span>{language === 'tg' ? 'Интизор шавед...' : 'Подождите...'}</span>
                     </>
+                  ) : emailCooldown > 0 ? (
+                    <span>
+                      {language === 'tg'
+                        ? `Ирсоли дубора пас аз ${emailCooldown} сония`
+                        : `Повтор через ${emailCooldown} сек`}
+                    </span>
                   ) : showForgotPassword ? (
                     <span>{language === 'tg' ? 'Ирсоли истиноди барқароркунӣ' : 'Сбросить пароль'}</span>
                   ) : isRegister ? (

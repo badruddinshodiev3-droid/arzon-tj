@@ -259,6 +259,7 @@ export function getSupabase(userId?: string): SupabaseClient | null {
         auth: {
           persistSession: true,
           autoRefreshToken: true,
+          detectSessionInUrl: true,
         },
         realtime: {
           params: {
