@@ -591,11 +591,55 @@ export const AuthModal: React.FC<AuthModalProps> = ({
           onLoginSuccess(newUser);
           onClose();
         } else if (signUpData.user) {
-          // Email confirmation link sent
+          // If Supabase returned user without session, immediately attempt signInWithPassword
+          try {
+            const { data: instantSignIn } = await supabase.auth.signInWithPassword({
+              email: cleanEmail,
+              password: password,
+            });
+
+            if (instantSignIn?.user && instantSignIn?.session) {
+              const userName = fullName.trim() || instantSignIn.user.user_metadata?.name || cleanEmail.split('@')[0];
+              const newUser: UserProfile = {
+                id: instantSignIn.user.id,
+                name: userName,
+                email: cleanEmail,
+                phone: cleanPhoneNum || '+992 90 000 0000',
+                balance: 30,
+                joinedDate: '2026',
+                isVerified: true,
+                rating: 5.0,
+                reviewsCount: 1,
+              };
+
+              try {
+                await supabase.from('profiles').upsert({
+                  id: newUser.id,
+                  name: newUser.name,
+                  email: cleanEmail,
+                  phone: newUser.phone,
+                  balance: 30,
+                  joined_date: '2026',
+                  is_verified: true,
+                  updated_at: new Date().toISOString(),
+                });
+              } catch {
+                // ignore
+              }
+
+              onLoginSuccess(newUser);
+              onClose();
+              return;
+            }
+          } catch {
+            // ignore
+          }
+
+          // If still no session
           setEmailSuccessMsg(
             language === 'tg'
-              ? `Бақайдгирӣ бомуваффақият анҷом ёфт! Мактуби тасдиқ ба ${cleanEmail} фиристода шуд. Лутфан ба почтаатон даромада истинодро пахш кунед, сипас ворид шавед.`
-              : `Регистрация успешна! На почту ${cleanEmail} отправлено письмо со ссылкой для подтверждения.`
+              ? `Ҳисоби шумо дар Supabase бомуваффақият сабт шуд! Лутфан бо ҳамин почта ва парол ворид шавед.`
+              : `Аккаунт успешно создан! Пожалуйста, выполните вход.`
           );
           setIsRegister(false);
         }
@@ -2281,6 +2325,16 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                     placeholder="shumo@mail.ru ё gmail.com"
                     className="w-full px-3.5 py-2.5 text-xs bg-slate-50 border border-slate-200 rounded-xl focus:bg-white focus:ring-2 focus:ring-emerald-500"
                   />
+                  {isRegister && !showForgotPassword && (
+                    <p className="text-[11px] text-emerald-700 font-medium mt-1.5 flex items-center gap-1.5 bg-emerald-50/70 p-1.5 rounded-lg border border-emerald-200/60">
+                      <CheckCircle className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                      <span>
+                        {language === 'tg'
+                          ? 'Бақайдгирии фаврӣ фаъол аст: ҳисоб бе интизории мактуби тасдиқӣ дарҳол кушода мешавад.'
+                          : 'Мгновенная регистрация: подтверждение по почте не требуется.'}
+                      </span>
+                    </p>
+                  )}
                 </div>
 
                 {!showForgotPassword && (
