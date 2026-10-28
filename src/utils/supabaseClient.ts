@@ -217,8 +217,11 @@ let supabaseInstance: SupabaseClient | null = null;
 let currentConfigKey = '';
 
 /**
- * Ensures an active Supabase authentication session exists
- * Sets up anonymous or device session with cryptographically signed JWT
+/**
+ * Ensures an active Supabase authentication session exists.
+ * If a real user session exists, returns its user ID.
+ * If a legacy synthetic test session exists (@arzon-messenger.tj), cleans it up so real Auth works.
+ * Does NOT generate fake accounts or interfere with real user email sign-up/sign-in.
  */
 export async function ensureSupabaseAuthSession(): Promise<{ userId: string } | null> {
   const supabase = getSupabase();
@@ -227,50 +230,17 @@ export async function ensureSupabaseAuthSession(): Promise<{ userId: string } | 
   try {
     const { data: sessionData } = await supabase.auth.getSession();
     if (sessionData?.session?.user) {
+      const email = (sessionData.session.user.email || '').toLowerCase();
+      // If an old synthetic email session exists, sign it out cleanly
+      if (email.includes('@arzon-messenger.tj')) {
+        await supabase.auth.signOut().catch(() => {});
+        return null;
+      }
       return { userId: sessionData.session.user.id };
     }
-
-    // Attempt 1: Anonymous sign in
-    try {
-      const { data: anonData, error: anonErr } = await supabase.auth.signInAnonymously();
-      if (!anonErr && anonData?.user) {
-        return { userId: anonData.user.id };
-      }
-    } catch {
-      // ignore
-    }
-
-    // Attempt 2: Deterministic device session
-    let guestId = 'guest-device';
-    if (typeof localStorage !== 'undefined') {
-      guestId = localStorage.getItem('arzontj_guest_id') || `guest-${Date.now().toString(36)}`;
-      localStorage.setItem('arzontj_guest_id', guestId);
-    }
-    const cleanId = guestId.replace(/[^a-zA-Z0-9]/g, '').slice(0, 16);
-    const synthEmail = `dev_${cleanId}@arzon-messenger.tj`;
-    const synthPass = `ArzonSecure_${cleanId}_2026!`;
-
-    const { data: signinData, error: signinErr } = await supabase.auth.signInWithPassword({
-      email: synthEmail,
-      password: synthPass,
-    });
-
-    if (!signinErr && signinData?.user) {
-      return { userId: signinData.user.id };
-    }
-
-    const { data: signupData, error: signupErr } = await supabase.auth.signUp({
-      email: synthEmail,
-      password: synthPass,
-    });
-
-    if (!signupErr && signupData?.user) {
-      return { userId: signupData.user.id };
-    }
-
     return null;
   } catch (err) {
-    console.warn('ensureSupabaseAuthSession exception:', err);
+    console.warn('ensureSupabaseAuthSession error:', err);
     return null;
   }
 }

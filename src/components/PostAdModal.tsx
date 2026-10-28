@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { ProductAd, Language, UserProfile } from '../types';
 import { translations } from '../data/translations';
 import { CITIES, CATEGORIES } from '../data/taxonomy';
@@ -70,6 +70,17 @@ export const PostAdModal: React.FC<PostAdModalProps> = ({
   ]);
   const [isProcessingImages, setIsProcessingImages] = useState(false);
   const [errorMsg, setErrorMsg] = useState('');
+
+  useEffect(() => {
+    if (isOpen && currentUser) {
+      if (currentUser.name && !sellerName) {
+        setSellerName(currentUser.name);
+      }
+      if (currentUser.phone && (phone === '+992 ' || !phone.trim())) {
+        setPhone(currentUser.phone);
+      }
+    }
+  }, [isOpen, currentUser]);
 
   if (!isOpen) return null;
 

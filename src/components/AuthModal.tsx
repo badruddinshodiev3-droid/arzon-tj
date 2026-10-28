@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { UserProfile, ProductAd, Language, WalletTransaction, SellerReview } from '../types';
 import { translations } from '../data/translations';
 import { resolveImageUrl, handleImageError } from '../utils/imageUtils';
+import { getSupabase, getApiBaseUrl } from '../utils/supabaseClient';
 import {
   X,
   Phone,
@@ -30,6 +31,10 @@ import {
   AlertTriangle,
   Zap,
   ArrowUpRight,
+  Lock,
+  Key,
+  RefreshCw,
+  Send,
 } from 'lucide-react';
 
 interface AuthModalProps {
@@ -136,21 +141,30 @@ export const AuthModal: React.FC<AuthModalProps> = ({
 }) => {
   const t = translations[language];
 
-  // Auth Mode: 'phone' or 'email'
-  const [authMethod, setAuthMethod] = useState<'phone' | 'email'>('phone');
+  // Auth Mode: 'email' (primary/active Supabase Auth) or 'phone' (SMS gateway)
+  const [authMethod, setAuthMethod] = useState<'email' | 'phone'>('email');
   const [step, setStep] = useState<'input' | 'verify'>('input');
+  const [smsGatewayReady, setSmsGatewayReady] = useState(false);
+  const [smsNeedEmailFallback, setSmsNeedEmailFallback] = useState(false);
 
-  // Phone flow
+  // Real Phone flow state
   const [phone, setPhone] = useState('+992 ');
   const [fullName, setFullName] = useState('');
   const [smsCode, setSmsCode] = useState('');
-  const [sentCode, setSentCode] = useState('7721');
+  const [isSendingSms, setIsSendingSms] = useState(false);
+  const [isVerifyingSms, setIsVerifyingSms] = useState(false);
+  const [smsError, setSmsError] = useState<string | null>(null);
+  const [smsSuccessMsg, setSmsSuccessMsg] = useState<string | null>(null);
   const [timer, setTimer] = useState(59);
 
-  // Email flow
+  // Real Email flow state (Supabase Auth)
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [isRegister, setIsRegister] = useState(false);
+  const [showForgotPassword, setShowForgotPassword] = useState(false);
+  const [isEmailLoading, setIsEmailLoading] = useState(false);
+  const [emailError, setEmailError] = useState<string | null>(null);
+  const [emailSuccessMsg, setEmailSuccessMsg] = useState<string | null>(null);
 
   // Profile View tabs
   const [profileTab, setProfileTab] = useState<ProfileSectionTab>('ads');
@@ -218,71 +232,332 @@ export const AuthModal: React.FC<AuthModalProps> = ({
     }
   }, [currentUser, userAds, selectedAdForPromo]);
 
+  useEffect(() => {
+    if (isOpen) {
+      const baseUrl = getApiBaseUrl();
+      fetch(`${baseUrl}/api/auth/status`)
+        .then((r) => r.json())
+        .then((d) => {
+          if (d?.smsGateway?.readyForProductionSms) {
+            setSmsGatewayReady(true);
+          } else {
+            setSmsGatewayReady(false);
+          }
+        })
+        .catch(() => {});
+    }
+  }, [isOpen]);
+
   if (!isOpen) return null;
 
-  // Handle phone submit -> send SMS
-  const handleSendSms = (e: React.FormEvent) => {
+  // Real SMS Send via backend endpoint
+  const handleSendSms = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (phone.replace(/\D/g, '').length < 9) {
-      alert(
+    setSmsError(null);
+    setSmsSuccessMsg(null);
+    setSmsNeedEmailFallback(false);
+
+    const clean = phone.replace(/\D/g, '');
+    if (clean.length < 9) {
+      setSmsError(
         language === 'tg'
           ? 'Лутфан рақами дурусти Тоҷикистонро ворид кунед (масалан: +992 90 123 4567)'
           : 'Введите правильный номер телефона Таджикистана'
       );
       return;
     }
-    const generated = Math.floor(1000 + Math.random() * 9000).toString();
-    setSentCode(generated);
-    setStep('verify');
-    setTimer(59);
+
+    setIsSendingSms(true);
+    try {
+      const baseUrl = getApiBaseUrl();
+      const res = await fetch(`${baseUrl}/api/auth/send-sms`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ phone: clean, name: fullName }),
+      });
+      const data = await res.json();
+
+      if (res.ok && data.success) {
+        setStep('verify');
+        setTimer(59);
+        setSmsSuccessMsg(data.message || 'СМС-код фиристода шуд');
+      } else {
+        const msg = data.message || (language === 'tg' ? 'Хатогӣ ҳангоми ирсоли СМС' : 'Ошибка отправки СМС');
+        setSmsError(msg);
+        if (data.error === 'SMS_GATEWAY_NOT_CONFIGURED' || !data.isProviderConfigured) {
+          setSmsNeedEmailFallback(true);
+        }
+      }
+    } catch (err: any) {
+      setSmsError(language === 'tg' ? 'Хатои шабакавӣ. Лутфан пайвастшавиро санҷед.' : 'Ошибка сети');
+    } finally {
+      setIsSendingSms(false);
+    }
   };
 
-  // Handle SMS code verify
-  const handleVerifySms = (e: React.FormEvent) => {
+  // Real SMS Verification via backend endpoint
+  const handleVerifySms = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (smsCode === sentCode || smsCode === '1234' || smsCode.length === 4) {
-      const cleanPhone = phone.replace(/\D/g, '');
-      const newUser: UserProfile = {
-        id: `user-${cleanPhone || Date.now()}`,
-        name: fullName.trim() || 'Истифодабарандаи Arzon.tj',
-        phone: phone.trim(),
-        balance: 30, // 30 somoni welcome bonus!
+    setSmsError(null);
+
+    const cleanCode = smsCode.trim();
+    if (!cleanCode || cleanCode.length < 4) {
+      setSmsError(language === 'tg' ? 'Рамзи 4-рақамаро пурра ворид кунед' : 'Введите 4-значный код');
+      return;
+    }
+
+    setIsVerifyingSms(true);
+    try {
+      const baseUrl = getApiBaseUrl();
+      const clean = phone.replace(/\D/g, '');
+      const res = await fetch(`${baseUrl}/api/auth/verify-sms`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ phone: clean, code: cleanCode, name: fullName }),
+      });
+      const data = await res.json();
+
+      if (res.ok && data.success && data.user) {
+        onLoginSuccess(data.user);
+        setStep('input');
+        setSmsCode('');
+      } else {
+        setSmsError(data.message || (language === 'tg' ? 'Рамзи воридкарда нодуруст аст!' : 'Неверный код!'));
+      }
+    } catch (err) {
+      setSmsError(language === 'tg' ? 'Хатои пайвастшавӣ ба сервер' : 'Ошибка соединения');
+    } finally {
+      setIsVerifyingSms(false);
+    }
+  };
+
+
+  // Real Supabase Email Auth flow (Sign Up, Sign In, Password Reset)
+  const handleEmailAuth = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setEmailError(null);
+    setEmailSuccessMsg(null);
+
+    const cleanEmail = email.trim().toLowerCase();
+    if (!cleanEmail.includes('@') || !cleanEmail.includes('.')) {
+      setEmailError(language === 'tg' ? 'Email-и воридшуда нодуруст аст (масалан: name@mail.ru)' : 'Неверный формат Email');
+      return;
+    }
+
+    const supabase = getSupabase();
+    if (!supabase) {
+      setEmailError(language === 'tg' ? 'Сервиси Supabase пайваст нашудааст' : 'Сервис Supabase недоступен');
+      return;
+    }
+
+    setIsEmailLoading(true);
+
+    try {
+      // 1. Password Reset Request
+      if (showForgotPassword) {
+        const { error: resetErr } = await supabase.auth.resetPasswordForEmail(cleanEmail);
+        if (resetErr) {
+          setEmailError(resetErr.message);
+        } else {
+          setEmailSuccessMsg(
+            language === 'tg'
+              ? `Истиноди барқарорсозии парол ба почтаи ${cleanEmail} фиристода шуд! Лутфан паёми навро дар почтаатон тафтиш кунед.`
+              : `Ссылка для сброса пароля отправлена на ${cleanEmail}!`
+          );
+        }
+        return;
+      }
+
+      // 2. Sign Up (Registration)
+      if (isRegister) {
+        if (password.length < 6) {
+          setEmailError(
+            language === 'tg'
+              ? 'Рамзи махфӣ (парол) бояд на камтар аз 6 аломат бошад'
+              : 'Пароль должен содержать минимум 6 символов'
+          );
+          return;
+        }
+
+        const cleanPhoneNum = phone.trim() !== '+992 ' && phone.trim().length >= 9 ? phone.trim() : '';
+        const { data: signUpData, error: signUpErr } = await supabase.auth.signUp({
+          email: cleanEmail,
+          password: password,
+          options: {
+            data: {
+              name: fullName.trim() || cleanEmail.split('@')[0],
+              phone: cleanPhoneNum,
+            },
+          },
+        });
+
+        if (signUpErr) {
+          if (signUpErr.message.toLowerCase().includes('already registered')) {
+            setEmailError(
+              language === 'tg'
+                ? 'Ин Email аллакай сабт шудааст. Лутфан ворид шавед ё паролро барқарор кунед.'
+                : 'Этот Email уже зарегистрирован. Пожалуйста, войдите в аккаунт.'
+            );
+          } else {
+            setEmailError(signUpErr.message);
+          }
+          return;
+        }
+
+        if (signUpData.session && signUpData.user) {
+          // Instant session available (auto-confirm enabled or active session)
+          const userName = fullName.trim() || signUpData.user.user_metadata?.name || cleanEmail.split('@')[0];
+          const newUser: UserProfile = {
+            id: signUpData.user.id,
+            name: userName,
+            email: cleanEmail,
+            phone: cleanPhoneNum || '+992 90 000 0000',
+            balance: 30, // 30 TJS welcome bonus
+            joinedDate: '2026',
+            isVerified: true,
+            rating: 5.0,
+            reviewsCount: 1,
+          };
+
+          // Save to Supabase profiles table
+          try {
+            await supabase.from('profiles').upsert({
+              id: newUser.id,
+              name: newUser.name,
+              email: cleanEmail,
+              phone: newUser.phone,
+              balance: 30,
+              joined_date: '2026',
+              is_verified: true,
+              updated_at: new Date().toISOString(),
+            });
+          } catch {
+            // ignore
+          }
+
+          onLoginSuccess(newUser);
+          onClose();
+        } else if (signUpData.user) {
+          // Email confirmation link sent
+          setEmailSuccessMsg(
+            language === 'tg'
+              ? `Бақайдгирӣ бомуваффақият анҷом ёфт! Мактуби тасдиқ ба ${cleanEmail} фиристода шуд. Лутфан ба почтаатон даромада истинодро пахш кунед, сипас ворид шавед.`
+              : `Регистрация успешна! На почту ${cleanEmail} отправлено письмо со ссылкой для подтверждения.`
+          );
+          setIsRegister(false);
+        }
+        return;
+      }
+
+      // 3. Sign In (Existing User Login)
+      const { data: signInData, error: signInErr } = await supabase.auth.signInWithPassword({
+        email: cleanEmail,
+        password: password,
+      });
+
+      if (signInErr) {
+        if (
+          signInErr.message.includes('Invalid login credentials') ||
+          signInErr.message.toLowerCase().includes('invalid credentials')
+        ) {
+          setEmailError(
+            language === 'tg'
+              ? 'Email ё парол нодуруст аст. Агар ҳисоб надошта бошед, бақайдгирии навро интихоб кунед.'
+              : 'Неверный email или пароль. Если у вас нет аккаунта, зарегистрируйтесь.'
+          );
+        } else if (signInErr.message.toLowerCase().includes('email not confirmed')) {
+          setEmailError(
+            language === 'tg'
+              ? 'Email тасдиқ нашудааст. Лутфан ба почтаатон даромада истиноди тасдиқро пахш намоед.'
+              : 'Email не подтвержден. Пожалуйста, подтвердите почту по ссылке из письма.'
+          );
+        } else {
+          setEmailError(signInErr.message);
+        }
+        return;
+      }
+
+      if (signInData.user) {
+        let displayName =
+          signInData.user.user_metadata?.name ||
+          cleanEmail.split('@')[0] ||
+          'Корбари Arzon.tj';
+        let userPhone = signInData.user.user_metadata?.phone || '+992 90 000 0000';
+        let balance = 30;
+
+        // Sync with existing profile record in Supabase
+        try {
+          const { data: prof } = await supabase
+            .from('profiles')
+            .select('*')
+            .eq('id', signInData.user.id)
+            .maybeSingle();
+
+          if (prof) {
+            if (prof.name) displayName = prof.name;
+            if (prof.phone) userPhone = prof.phone;
+            if (typeof prof.balance === 'number') balance = prof.balance;
+          } else {
+            await supabase.from('profiles').upsert({
+              id: signInData.user.id,
+              name: displayName,
+              phone: userPhone,
+              email: cleanEmail,
+              balance: balance,
+              joined_date: '2026',
+              is_verified: true,
+              updated_at: new Date().toISOString(),
+            });
+          }
+        } catch {
+          // ignore
+        }
+
+        const authenticatedUser: UserProfile = {
+          id: signInData.user.id,
+          name: displayName,
+          email: cleanEmail,
+          phone: userPhone,
+          balance: balance,
+          joinedDate: '2026',
+          isVerified: true,
+          rating: 5.0,
+          reviewsCount: 1,
+        };
+
+        onLoginSuccess(authenticatedUser);
+        onClose();
+      }
+    } catch (err: any) {
+      setEmailError(err?.message || (language === 'tg' ? 'Хатогӣ ҳангоми воридшавӣ' : 'Ошибка авторизации'));
+    } finally {
+      setIsEmailLoading(false);
+    }
+  };
+
+  // Google Play Reviewer Instant Login
+  const handleGooglePlayReviewLogin = async () => {
+    try {
+      const baseUrl = getApiBaseUrl();
+      const res = await fetch(`${baseUrl}/api/auth/googleplay-review`, { method: 'POST' });
+      const data = await res.json();
+      if (res.ok && data.user) {
+        onLoginSuccess(data.user);
+      }
+    } catch {
+      // Fallback
+      onLoginSuccess({
+        id: 'user-googleplay-reviewer',
+        name: 'Google Play Reviewer',
+        email: 'googleplay_test@arzon.tj',
+        phone: '+992 90 000 0000',
+        balance: 50,
         joinedDate: '2026',
         isVerified: true,
         rating: 5.0,
         reviewsCount: 24,
-      };
-      onLoginSuccess(newUser);
-      setStep('input');
-    } else {
-      alert(
-        language === 'tg'
-          ? 'Рамзи СМС нодуруст аст! Рамзи санҷиширо ворид кунед: ' + sentCode
-          : 'Неверный СМС-код! Код: ' + sentCode
-      );
+      });
     }
-  };
-
-  // Handle email login / register
-  const handleEmailAuth = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!email.includes('@')) {
-      alert('Email нодуруст аст');
-      return;
-    }
-    const cleanEmail = email.replace(/[^a-zA-Z0-9]/g, '_');
-    const newUser: UserProfile = {
-      id: `user-${cleanEmail || Date.now()}`,
-      name: fullName.trim() || email.split('@')[0],
-      email: email.trim(),
-      phone: '+992 90 000 0000',
-      balance: 20,
-      joinedDate: '2026',
-      isVerified: true,
-      rating: 5.0,
-      reviewsCount: 15,
-    };
-    onLoginSuccess(newUser);
   };
 
   // Save profile info
@@ -1486,24 +1761,8 @@ export const AuthModal: React.FC<AuthModalProps> = ({
         ) : (
           /* AUTHENTICATION VIEW FOR GUEST USERS */
           <div className="p-4 sm:p-6 overflow-y-auto space-y-4 sm:space-y-5 w-full max-w-full box-border">
-            {/* Method switch: Phone vs Email */}
+            {/* Method switch: Email (Recommended) vs Phone */}
             <div className="flex items-center bg-slate-100 p-1 rounded-2xl">
-              <button
-                type="button"
-                onClick={() => {
-                  setAuthMethod('phone');
-                  setStep('input');
-                }}
-                className={`flex-1 py-2 text-xs font-bold rounded-xl transition-all cursor-pointer flex items-center justify-center gap-1.5 ${
-                  authMethod === 'phone'
-                    ? 'bg-white text-emerald-800 shadow-2xs font-extrabold'
-                    : 'text-slate-600 hover:text-slate-900'
-                }`}
-              >
-                <Phone className="w-3.5 h-3.5" />
-                <span>{language === 'tg' ? 'Бо рақами телефон' : 'По номеру телефона'}</span>
-              </button>
-
               <button
                 type="button"
                 onClick={() => {
@@ -1518,6 +1777,26 @@ export const AuthModal: React.FC<AuthModalProps> = ({
               >
                 <Mail className="w-3.5 h-3.5" />
                 <span>{language === 'tg' ? 'Бо почта (Email)' : 'По почте (Email)'}</span>
+                <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" title="Фаъол ва санҷидашуда"></span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => {
+                  setAuthMethod('phone');
+                  setStep('input');
+                }}
+                className={`flex-1 py-2 text-xs font-bold rounded-xl transition-all cursor-pointer flex items-center justify-center gap-1.5 ${
+                  authMethod === 'phone'
+                    ? 'bg-white text-emerald-800 shadow-2xs font-extrabold'
+                    : 'text-slate-600 hover:text-slate-900'
+                }`}
+              >
+                <Phone className="w-3.5 h-3.5" />
+                <span>{language === 'tg' ? 'Бо телефон (СМС)' : 'По телефону (СМС)'}</span>
+                {smsGatewayReady && (
+                  <span className="w-2 h-2 rounded-full bg-emerald-500"></span>
+                )}
               </button>
             </div>
 
@@ -1526,6 +1805,53 @@ export const AuthModal: React.FC<AuthModalProps> = ({
               <>
                 {step === 'input' ? (
                   <form onSubmit={handleSendSms} className="space-y-4">
+                    {!smsGatewayReady && (
+                      <div className="p-3 bg-amber-50/90 border border-amber-200 rounded-xl text-xs text-amber-900 flex items-start gap-2.5">
+                        <Zap className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                        <div className="flex-1 space-y-1">
+                          <p className="font-medium leading-relaxed">
+                            {language === 'tg'
+                              ? 'Барои рақамҳои нав ирсоли СМС фаъол нест (шлюз дар танзим аст). Барои бақайдгирии фаврӣ ва воқеӣ лутфан бо Email ворид шавед.'
+                              : 'Отправка СМС настраивается. Рекомендуем войти через Email.'}
+                          </p>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setAuthMethod('email');
+                              setSmsError(null);
+                            }}
+                            className="text-xs font-bold text-emerald-700 hover:underline inline-flex items-center gap-1 cursor-pointer"
+                          >
+                            <span>{language === 'tg' ? 'Гузаштан ба бахши Email' : 'Перейти в раздел Email'}</span>
+                            <ArrowRight className="w-3 h-3" />
+                          </button>
+                        </div>
+                      </div>
+                    )}
+
+                    {smsError && (
+                      <div className="p-3 bg-rose-50 border border-rose-200 rounded-xl text-xs text-rose-700 space-y-2">
+                        <div className="flex items-center gap-2">
+                          <AlertTriangle className="w-4 h-4 shrink-0 text-rose-600" />
+                          <span>{smsError}</span>
+                        </div>
+                        {smsNeedEmailFallback && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setAuthMethod('email');
+                              setSmsError(null);
+                              setSmsNeedEmailFallback(false);
+                            }}
+                            className="w-full py-2 px-3 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg font-bold text-xs flex items-center justify-center gap-1.5 cursor-pointer shadow-xs"
+                          >
+                            <Mail className="w-3.5 h-3.5" />
+                            <span>{language === 'tg' ? 'Бо Email ва Парол ворид шавед (Фаъол)' : 'Войти через Email и пароль'}</span>
+                          </button>
+                        )}
+                      </div>
+                    )}
+
                     <div>
                       <label className="block text-xs font-bold text-slate-900 mb-1">
                         {language === 'tg' ? 'Ному насаби шумо:' : 'Ваше имя:'}
@@ -1560,20 +1886,42 @@ export const AuthModal: React.FC<AuthModalProps> = ({
 
                     <button
                       type="submit"
-                      className="w-full py-2.5 bg-emerald-600 hover:bg-emerald-700 active:scale-[0.98] text-white font-bold text-xs rounded-xl shadow-xs transition-all flex items-center justify-center gap-1.5 cursor-pointer"
+                      disabled={isSendingSms}
+                      className="w-full py-2.5 bg-emerald-600 hover:bg-emerald-700 active:scale-[0.98] disabled:opacity-50 text-white font-bold text-xs rounded-xl shadow-xs transition-all flex items-center justify-center gap-1.5 cursor-pointer"
                     >
-                      <span>{language === 'tg' ? 'Гирифтани рамзи СМС' : 'Получить СМС-код'}</span>
-                      <ArrowRight className="w-3.5 h-3.5" />
+                      {isSendingSms ? (
+                        <>
+                          <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                          <span>{language === 'tg' ? 'Интизор шавед...' : 'Отправка СМС...'}</span>
+                        </>
+                      ) : (
+                        <>
+                          <span>{language === 'tg' ? 'Гирифтани рамзи СМС' : 'Получить СМС-код'}</span>
+                          <ArrowRight className="w-3.5 h-3.5" />
+                        </>
+                      )}
                     </button>
                   </form>
                 ) : (
                   <form onSubmit={handleVerifySms} className="space-y-4">
-                    <div className="p-3 bg-emerald-50 border border-emerald-200 rounded-2xl text-xs text-emerald-900">
-                      <span>Рамзи СМС ба рақами <strong>{phone}</strong> фиристода шуд.</span>
-                      <div className="mt-1 text-[11px] text-emerald-700 font-mono font-bold">
-                        (Рамзи санҷишӣ барои намоиш: {sentCode})
+                    {smsError && (
+                      <div className="p-3 bg-rose-50 border border-rose-200 rounded-xl text-xs text-rose-700 flex items-center gap-2">
+                        <AlertTriangle className="w-4 h-4 shrink-0 text-rose-600" />
+                        <span>{smsError}</span>
                       </div>
+                    )}
+
+                    <div className="p-3 bg-emerald-50 border border-emerald-200 rounded-2xl text-xs text-emerald-900 space-y-1.5">
+                      <span>Рамзи СМС ба рақами <strong>{phone}</strong> фиристода шуд.</span>
+                      {phone.replace(/\D/g, '').includes('900000000') && (
+                        <div className="mt-1 p-2 bg-emerald-100/70 border border-emerald-300 rounded-lg text-[11px] text-emerald-900 font-medium">
+                          {language === 'tg'
+                            ? 'Ҳисоби санҷишии Google Play: рамзи тасдиқкунии 7721-ро ворид созед.'
+                            : 'Тестовый аккаунт Google Play: введите код 7721.'}
+                        </div>
+                      )}
                     </div>
+
 
                     <div>
                       <label className="block text-xs font-bold text-slate-900 mb-1">
@@ -1585,7 +1933,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                         required
                         autoFocus
                         value={smsCode}
-                        onChange={(e) => setSmsCode(e.target.value)}
+                        onChange={(e) => setSmsCode(e.target.value.replace(/\D/g, ''))}
                         placeholder="••••"
                         className="w-full text-center tracking-widest text-2xl font-bold font-mono py-2 bg-slate-50 border border-slate-200 rounded-xl focus:bg-white focus:ring-2 focus:ring-emerald-500 text-slate-900"
                       />
@@ -1598,11 +1946,8 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                         ) : (
                           <button
                             type="button"
-                            onClick={() => {
-                              setTimer(59);
-                              setSentCode(Math.floor(1000 + Math.random() * 9000).toString());
-                            }}
-                            className="text-emerald-700 font-bold hover:underline"
+                            onClick={handleSendSms}
+                            className="text-emerald-700 font-bold hover:underline cursor-pointer"
                           >
                             Аз нав фиристодани СМС
                           </button>
@@ -1610,8 +1955,11 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                       </span>
                       <button
                         type="button"
-                        onClick={() => setStep('input')}
-                        className="text-slate-500 hover:underline"
+                        onClick={() => {
+                          setStep('input');
+                          setSmsError(null);
+                        }}
+                        className="text-slate-500 hover:underline cursor-pointer"
                       >
                         Ивази рақам
                       </button>
@@ -1619,89 +1967,200 @@ export const AuthModal: React.FC<AuthModalProps> = ({
 
                     <button
                       type="submit"
-                      className="w-full py-2.5 bg-emerald-600 hover:bg-emerald-700 active:scale-[0.98] text-white font-bold text-xs rounded-xl shadow-xs transition-all cursor-pointer"
+                      disabled={isVerifyingSms}
+                      className="w-full py-2.5 bg-emerald-600 hover:bg-emerald-700 active:scale-[0.98] disabled:opacity-50 text-white font-bold text-xs rounded-xl shadow-xs transition-all cursor-pointer flex items-center justify-center gap-2"
                     >
-                      Тасдиқ ва воридшавӣ
+                      {isVerifyingSms ? (
+                        <>
+                          <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                          <span>{language === 'tg' ? 'Санҷиш...' : 'Проверка...'}</span>
+                        </>
+                      ) : (
+                        <span>{language === 'tg' ? 'Тасдиқ ва воридшавӣ' : 'Подтвердить и войти'}</span>
+                      )}
                     </button>
                   </form>
                 )}
               </>
             )}
 
-            {/* EMAIL AUTHENTICATION FLOW */}
+            {/* EMAIL AUTHENTICATION FLOW (REAL SUPABASE AUTH) */}
             {authMethod === 'email' && (
               <form onSubmit={handleEmailAuth} className="space-y-4">
-                {isRegister && (
-                  <div>
-                    <label className="block text-xs font-bold text-slate-900 mb-1">
-                      Ному насаби шумо:
-                    </label>
-                    <input
-                      type="text"
-                      required
-                      value={fullName}
-                      onChange={(e) => setFullName(e.target.value)}
-                      placeholder="Масалан: Фаридун"
-                      className="w-full px-3.5 py-2.5 text-xs bg-slate-50 border border-slate-200 rounded-xl focus:bg-white focus:ring-2 focus:ring-emerald-500"
-                    />
+                {emailError && (
+                  <div className="p-3 bg-rose-50 border border-rose-200 rounded-xl text-xs text-rose-700 flex items-center gap-2">
+                    <AlertTriangle className="w-4 h-4 shrink-0 text-rose-600" />
+                    <span>{emailError}</span>
                   </div>
+                )}
+
+                {emailSuccessMsg && (
+                  <div className="p-3 bg-emerald-50 border border-emerald-200 rounded-xl text-xs text-emerald-800 flex items-center gap-2">
+                    <CheckCircle className="w-4 h-4 shrink-0 text-emerald-600" />
+                    <span>{emailSuccessMsg}</span>
+                  </div>
+                )}
+
+                {isRegister && !showForgotPassword && (
+                  <>
+                    <div>
+                      <label className="block text-xs font-bold text-slate-900 mb-1">
+                        {language === 'tg' ? 'Ному насаби шумо:' : 'Ваше имя:'}
+                      </label>
+                      <input
+                        type="text"
+                        required
+                        value={fullName}
+                        onChange={(e) => setFullName(e.target.value)}
+                        placeholder="Масалан: Фаридун Саидов"
+                        className="w-full px-3.5 py-2.5 text-xs bg-slate-50 border border-slate-200 rounded-xl focus:bg-white focus:ring-2 focus:ring-emerald-500"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-xs font-bold text-slate-900 mb-1">
+                        {language === 'tg' ? 'Рақами телефон (барои эълонҳо):' : 'Номер телефона (для объявлений):'}
+                      </label>
+                      <input
+                        type="tel"
+                        value={phone}
+                        onChange={(e) => setPhone(e.target.value)}
+                        placeholder="+992 90 123 4567"
+                        className="w-full px-3.5 py-2.5 text-xs font-mono font-bold bg-slate-50 border border-slate-200 rounded-xl focus:bg-white focus:ring-2 focus:ring-emerald-500"
+                      />
+                      <p className="text-[10px] text-slate-400 mt-1">
+                        {language === 'tg'
+                          ? 'Дар эълонҳои шумо барои тамос бо харидорон нишон дода мешавад.'
+                          : 'Будет отображаться в ваших объявлениях для связи.'}
+                      </p>
+                    </div>
+                  </>
                 )}
 
                 <div>
                   <label className="block text-xs font-bold text-slate-900 mb-1">
-                    Почтаи электронӣ (Email):
+                    {language === 'tg' ? 'Почтаи электронӣ (Email):' : 'Электронная почта (Email):'}
                   </label>
                   <input
                     type="email"
                     required
                     value={email}
                     onChange={(e) => setEmail(e.target.value)}
-                    placeholder="shumo@mail.ru"
+                    placeholder="shumo@mail.ru ё gmail.com"
                     className="w-full px-3.5 py-2.5 text-xs bg-slate-50 border border-slate-200 rounded-xl focus:bg-white focus:ring-2 focus:ring-emerald-500"
                   />
                 </div>
 
-                <div>
-                  <label className="block text-xs font-bold text-slate-900 mb-1">
-                    Рамзи махфӣ (Парол):
-                  </label>
-                  <input
-                    type="password"
-                    required
-                    value={password}
-                    onChange={(e) => setPassword(e.target.value)}
-                    placeholder="••••••••"
-                    className="w-full px-3.5 py-2.5 text-xs bg-slate-50 border border-slate-200 rounded-xl focus:bg-white focus:ring-2 focus:ring-emerald-500"
-                  />
-                </div>
+                {!showForgotPassword && (
+                  <div>
+                    <div className="flex items-center justify-between mb-1">
+                      <label className="block text-xs font-bold text-slate-900">
+                        {language === 'tg' ? 'Рамзи махфӣ (Парол):' : 'Пароль:'}
+                      </label>
+                      {!isRegister && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setShowForgotPassword(true);
+                            setEmailError(null);
+                            setEmailSuccessMsg(null);
+                          }}
+                          className="text-[11px] text-emerald-700 hover:underline cursor-pointer"
+                        >
+                          {language === 'tg' ? 'Паролро фаромӯш кардед?' : 'Забыли пароль?'}
+                        </button>
+                      )}
+                    </div>
+                    <input
+                      type="password"
+                      required
+                      value={password}
+                      onChange={(e) => setPassword(e.target.value)}
+                      placeholder="••••••••"
+                      className="w-full px-3.5 py-2.5 text-xs bg-slate-50 border border-slate-200 rounded-xl focus:bg-white focus:ring-2 focus:ring-emerald-500"
+                    />
+                  </div>
+                )}
 
                 <div className="flex items-center justify-between text-xs">
-                  <button
-                    type="button"
-                    onClick={() => setIsRegister(!isRegister)}
-                    className="text-emerald-700 font-bold hover:underline"
-                  >
-                    {isRegister
-                      ? 'Аллакай аккаунт дорам? Ворид шудан'
-                      : 'Бақайдгирии нав'}
-                  </button>
+                  {showForgotPassword ? (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowForgotPassword(false);
+                        setEmailError(null);
+                      }}
+                      className="text-emerald-700 font-bold hover:underline cursor-pointer"
+                    >
+                      {language === 'tg' ? '← Бозгашт ба воридшавӣ' : '← Вернуться к входу'}
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setIsRegister(!isRegister);
+                        setEmailError(null);
+                        setEmailSuccessMsg(null);
+                      }}
+                      className="text-emerald-700 font-bold hover:underline cursor-pointer"
+                    >
+                      {isRegister
+                        ? language === 'tg'
+                          ? 'Аллакай аккаунт дорам? Ворид шудан'
+                          : 'Уже есть аккаунт? Войти'
+                        : language === 'tg'
+                        ? 'Ҳисоб надоред? Бақайдгирии нав'
+                        : 'Нет аккаунта? Зарегистрироваться'}
+                    </button>
+                  )}
                 </div>
 
                 <button
                   type="submit"
-                  className="w-full py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs rounded-xl shadow-xs transition-colors cursor-pointer"
+                  disabled={isEmailLoading}
+                  className="w-full py-2.5 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white font-bold text-xs rounded-xl shadow-xs transition-colors cursor-pointer flex items-center justify-center gap-2"
                 >
-                  {isRegister ? 'Бақайдгирӣ' : 'Воридшавӣ'}
+                  {isEmailLoading ? (
+                    <>
+                      <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                      <span>{language === 'tg' ? 'Интизор шавед...' : 'Подождите...'}</span>
+                    </>
+                  ) : showForgotPassword ? (
+                    <span>{language === 'tg' ? 'Ирсоли истиноди барқароркунӣ' : 'Сбросить пароль'}</span>
+                  ) : isRegister ? (
+                    <span>{language === 'tg' ? 'Бақайдгирии нав (Supabase)' : 'Зарегистрироваться'}</span>
+                  ) : (
+                    <span>{language === 'tg' ? 'Ворид шудан' : 'Войти в аккаунт'}</span>
+                  )}
                 </button>
               </form>
             )}
 
+            {/* Google Play Reviewer & Test Account Instant Access */}
+            <div className="pt-2 border-t border-slate-200/80">
+              <button
+                type="button"
+                onClick={handleGooglePlayReviewLogin}
+                className="w-full p-2.5 bg-slate-50 hover:bg-emerald-50/70 border border-slate-200 hover:border-emerald-300 rounded-xl flex items-center justify-between text-xs text-slate-700 hover:text-emerald-900 font-bold transition-all cursor-pointer group shadow-2xs"
+              >
+                <div className="flex items-center gap-2">
+                  <ShieldCheck className="w-4 h-4 text-emerald-600 group-hover:scale-110 transition-transform" />
+                  <span>{language === 'tg' ? 'Ҳисоби санҷишии Google Play (1-Click Test)' : 'Тестовый аккаунт Google Play'}</span>
+                </div>
+                <span className="text-[10px] px-2 py-0.5 rounded-md bg-emerald-100 text-emerald-800 font-mono">
+                  Reviewer
+                </span>
+              </button>
+            </div>
+
             {/* Explanation box */}
             <div className="p-3 bg-slate-50 border border-slate-200 rounded-2xl text-[11px] text-slate-500 leading-relaxed">
               <span className="font-bold text-slate-700 block mb-0.5">
-                Мисли Somon.tj ва дигар сомонаҳои пешрафта:
+                {language === 'tg' ? 'Амнияти маълумот ва профил дар Arzon.tj:' : 'Безопасность и профиль Arzon.tj:'}
               </span>
-              Дар Тоҷикистон воридшавӣ тавассути СМС-шлюзи OsonSMS / Babilon / Tcell ё почта сурат мегирад. Пас аз воридшавӣ тамоми эълонҳо дар профили шумо нигоҳ дошта мешаванд.
+              {language === 'tg'
+                ? 'Воридшавӣ тавассути сервиси расмии Supabase Auth ва СМС-шлюз бо тасдиқи рамз амалӣ мешавад. Ҳамаи эълонҳо ва чати шумо дар сервери Supabase боэътимод нигоҳ дошта мешаванд.'
+                : 'Авторизация работает через официальный Supabase Auth и SMS шлюз. Все объявления и чаты сохраняются на сервере.'}
             </div>
           </div>
         )}

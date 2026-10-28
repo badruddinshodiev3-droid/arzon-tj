@@ -164,6 +164,405 @@ app.post('/api/supabase-public-config', (req: Request, res: Response) => {
 });
 
 // =============================================================================
+// REAL PHONE & SMS AUTHENTICATION GATEWAY
+// Supports OsonSMS (Tajikistan), Twilio, and secure OTP verification
+// =============================================================================
+interface PhoneOtpRecord {
+  phone: string;
+  code: string;
+  name?: string;
+  createdAt: number;
+  expiresAt: number;
+  attempts: number;
+}
+
+const phoneOtpStore = new Map<string, PhoneOtpRecord>();
+
+// Clean up expired OTPs every 5 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [phone, record] of phoneOtpStore.entries()) {
+    if (now > record.expiresAt) {
+      phoneOtpStore.delete(phone);
+    }
+  }
+}, 5 * 60 * 1000);
+
+// Persistent file store for SMS gateway configuration (OsonSMS / Twilio)
+interface SmsGatewayConfig {
+  osonLogin?: string;
+  osonHash?: string;
+  osonSenderName?: string;
+  twilioSid?: string;
+  twilioToken?: string;
+  twilioFrom?: string;
+}
+
+const SMS_CONFIG_FILE = path.resolve(DATA_DIR, 'sms-config.json');
+
+function loadSmsConfig(): SmsGatewayConfig | null {
+  try {
+    if (fs.existsSync(SMS_CONFIG_FILE)) {
+      const data = fs.readFileSync(SMS_CONFIG_FILE, 'utf-8');
+      const parsed = JSON.parse(data);
+      if (parsed && typeof parsed === 'object') return parsed;
+    }
+  } catch (err) {
+    console.error('Error reading sms config:', err);
+  }
+  return null;
+}
+
+function saveSmsConfigFile(cfg: SmsGatewayConfig): void {
+  try {
+    if (!fs.existsSync(DATA_DIR)) {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+    }
+    fs.writeFileSync(SMS_CONFIG_FILE, JSON.stringify(cfg, null, 2), 'utf-8');
+  } catch (err) {
+    console.error('Error saving sms config:', err);
+  }
+}
+
+// 1. Send SMS OTP Endpoint (Secure, no devCode returned to client)
+app.post('/api/auth/send-sms', async (req: Request, res: Response) => {
+  try {
+    const { phone, name } = req.body || {};
+    if (!phone || typeof phone !== 'string') {
+      return res.status(400).json({ success: false, error: 'PHONE_REQUIRED', message: 'Рақами телефон лозим аст' });
+    }
+
+    const cleanPhone = phone.replace(/\D/g, '');
+    if (cleanPhone.length < 9) {
+      return res.status(400).json({
+        success: false,
+        error: 'INVALID_PHONE',
+        message: 'Лутфан рақами дурусти телефонро ворид кунед (масалан: +992 90 123 4567)',
+      });
+    }
+
+    // Rate limiting per phone number: max 1 SMS per 45 seconds
+    const existing = phoneOtpStore.get(cleanPhone);
+    const now = Date.now();
+    if (existing && now - existing.createdAt < 45 * 1000) {
+      const waitSec = Math.ceil((45 * 1000 - (now - existing.createdAt)) / 1000);
+      return res.status(429).json({
+        success: false,
+        error: 'RATE_LIMIT',
+        message: `Илтимос, ${waitSec} сония интизор шавед ва аз нав кӯшиш кунед.`,
+      });
+    }
+
+    // Is test / review phone dedicated for Google Play Reviewers?
+    const isTestPhone = cleanPhone === '992900000000' || cleanPhone === '900000000' || cleanPhone === '992000000000';
+    if (isTestPhone) {
+      // Store dedicated test verification code for Google Play store reviewers as documented in GOOGLE_PLAY_REVIEW.md
+      phoneOtpStore.set(cleanPhone, {
+        phone: cleanPhone,
+        code: '7721',
+        name: name ? String(name).trim() : 'Google Play Reviewer',
+        createdAt: now,
+        expiresAt: now + 30 * 60 * 1000,
+        attempts: 0,
+      });
+
+      return res.json({
+        success: true,
+        phone: cleanPhone,
+        smsDispatched: false,
+        isTestAccount: true,
+        message: 'Ҳисоби санҷишии Google Play шинохта шуд. Рамзи тасдиқи 7721-ро ворид намоед.',
+      });
+    }
+
+    // Check external SMS Provider configuration from environment or persisted config
+    const smsCfg = loadSmsConfig();
+    const osonLogin = process.env.OSONSMS_LOGIN || smsCfg?.osonLogin;
+    const osonHash = process.env.OSONSMS_HASH || smsCfg?.osonHash;
+    const osonSender = process.env.OSONSMS_SENDER_NAME || smsCfg?.osonSenderName || 'Arzon.tj';
+
+    const twilioSid = process.env.TWILIO_ACCOUNT_SID || smsCfg?.twilioSid;
+    const twilioToken = process.env.TWILIO_AUTH_TOKEN || smsCfg?.twilioToken;
+    const twilioFrom = process.env.TWILIO_FROM || smsCfg?.twilioFrom;
+
+    const isProviderConfigured = Boolean((osonLogin && osonHash) || (twilioSid && twilioToken));
+
+    if (!isProviderConfigured) {
+      return res.status(400).json({
+        success: false,
+        error: 'SMS_GATEWAY_NOT_CONFIGURED',
+        smsDispatched: false,
+        isProviderConfigured: false,
+        message: 'Хадамоти ирсоли СМС фаъол нест (шлюзи расмии OsonSMS дар сервер танзим нашудааст). Лутфан бо Email ва Парол бақайдгирӣ намоед ё ворид шавед.',
+      });
+    }
+
+    // Generate random 4-digit OTP
+    const otpCode = String(crypto.randomInt(1000, 9999));
+
+    // Store OTP with 5 minute expiration
+    phoneOtpStore.set(cleanPhone, {
+      phone: cleanPhone,
+      code: otpCode,
+      name: name ? String(name).trim() : undefined,
+      createdAt: now,
+      expiresAt: now + 5 * 60 * 1000,
+      attempts: 0,
+    });
+
+    let smsDispatched = false;
+    let providerName = 'none';
+
+    // 1. Attempt OsonSMS (Tajikistan direct gateway)
+    if (osonLogin && osonHash) {
+      try {
+        const smsText = `Рамзи тасдиқи Arzon.tj: ${otpCode}. Ба ҳеҷ кас нагӯед!`;
+        const osonUrl = `https://api.osonsms.com/sendsms_v1.php?msg=${encodeURIComponent(
+          smsText
+        )}&phone_number=${cleanPhone}&login=${encodeURIComponent(osonLogin)}&str_hash=${encodeURIComponent(
+          osonHash
+        )}&sender_id=${encodeURIComponent(osonSender)}`;
+
+        const response = await fetch(osonUrl);
+        if (response.ok) {
+          smsDispatched = true;
+          providerName = 'osonsms';
+          console.log(`[SMS DISPATCHED via OsonSMS] to ${cleanPhone}`);
+        } else {
+          console.warn('[OsonSMS dispatch failed]:', await response.text());
+        }
+      } catch (osonErr) {
+        console.error('[OsonSMS network error]:', osonErr);
+      }
+    }
+
+    // 2. Attempt Twilio if OsonSMS is not configured
+    if (!smsDispatched && twilioSid && twilioToken && twilioFrom) {
+      try {
+        const twilioUrl = `https://api.twilio.com/2010-04-01/Accounts/${twilioSid}/Messages.json`;
+        const formattedTo = cleanPhone.startsWith('+') ? cleanPhone : `+${cleanPhone}`;
+        const formData = new URLSearchParams({
+          To: formattedTo,
+          From: twilioFrom,
+          Body: `Рамзи тасдиқи Arzon.tj: ${otpCode}`,
+        });
+
+        const twilioAuth = Buffer.from(`${twilioSid}:${twilioToken}`).toString('base64');
+        const response = await fetch(twilioUrl, {
+          method: 'POST',
+          headers: {
+            Authorization: `Basic ${twilioAuth}`,
+            'Content-Type': 'application/x-www-form-urlencoded',
+          },
+          body: formData.toString(),
+        });
+
+        if (response.ok) {
+          smsDispatched = true;
+          providerName = 'twilio';
+          console.log(`[SMS DISPATCHED via Twilio] to ${cleanPhone}`);
+        } else {
+          console.warn('[Twilio dispatch error]:', await response.text());
+        }
+      } catch (twErr) {
+        console.error('[Twilio network error]:', twErr);
+      }
+    }
+
+    if (smsDispatched) {
+      return res.json({
+        success: true,
+        phone: cleanPhone,
+        smsDispatched: true,
+        provider: providerName,
+        isProviderConfigured: true,
+        message: 'СМС-код ба рақами телефони шумо бомуваффақият фиристода шуд!',
+      });
+    } else {
+      return res.status(502).json({
+        success: false,
+        error: 'SMS_DISPATCH_FAILED',
+        message: 'Хатогӣ ҳангоми ирсоли СМС тавассути оператор. Лутфан бо Email ворид шавед.',
+      });
+    }
+  } catch (err: any) {
+    console.error('Send SMS error:', err);
+    return res.status(500).json({ success: false, error: 'SERVER_ERROR', message: 'Хатогии дохилии сервер' });
+  }
+});
+
+
+// 2. Verify SMS OTP Endpoint
+app.post('/api/auth/verify-sms', (req: Request, res: Response) => {
+  try {
+    const { phone, code, name } = req.body || {};
+    if (!phone || !code) {
+      return res.status(400).json({ success: false, error: 'MISSING_FIELDS', message: 'Рақам ва рамз лозиманд' });
+    }
+
+    const cleanPhone = phone.replace(/\D/g, '');
+    const cleanCode = String(code).trim();
+    const record = phoneOtpStore.get(cleanPhone);
+
+    if (!record) {
+      return res.status(400).json({
+        success: false,
+        error: 'OTP_EXPIRED_OR_NOT_FOUND',
+        message: 'Рамз ёфт нашуд ё муҳлаташ гузаштааст. Лутфан рамзи навро дархост кунед.',
+      });
+    }
+
+    if (Date.now() > record.expiresAt) {
+      phoneOtpStore.delete(cleanPhone);
+      return res.status(400).json({
+        success: false,
+        error: 'OTP_EXPIRED',
+        message: 'Муҳлати 5-дақиқагии рамз гузашт. Лутфан аз нав СМС гиред.',
+      });
+    }
+
+    if (record.attempts >= 5) {
+      phoneOtpStore.delete(cleanPhone);
+      return res.status(429).json({
+        success: false,
+        error: 'TOO_MANY_ATTEMPTS',
+        message: 'Шумораи кӯшишҳо аз ҳад зиёд шуд. Лутфан аз нав СМС гиред.',
+      });
+    }
+
+    record.attempts += 1;
+
+    // Check code match
+    if (record.code !== cleanCode) {
+      return res.status(400).json({
+        success: false,
+        error: 'INVALID_CODE',
+        message: 'Рамзи воридкарда нодуруст аст! Лутфан бодиққат санҷед.',
+      });
+    }
+
+    // Code is valid! Delete OTP from store
+    phoneOtpStore.delete(cleanPhone);
+
+    const userName =
+      (name && String(name).trim()) ||
+      record.name ||
+      `Истифодабаранда (+${cleanPhone.slice(-4)})`;
+
+    const verifiedUser = {
+      id: `user-${cleanPhone}`,
+      name: userName,
+      phone: cleanPhone.startsWith('+') ? cleanPhone : `+${cleanPhone.startsWith('992') ? cleanPhone : '992' + cleanPhone}`,
+      balance: 30, // 30 TJS welcome bonus
+      joinedDate: '2026',
+      isVerified: true,
+      rating: 5.0,
+      reviewsCount: 1,
+    };
+
+    return res.json({
+      success: true,
+      user: verifiedUser,
+      message: 'Шумо бомуваффақият ворид шудед!',
+    });
+  } catch (err: any) {
+    console.error('Verify SMS error:', err);
+    return res.status(500).json({ success: false, error: 'SERVER_ERROR', message: 'Хатои дохилӣ' });
+  }
+});
+
+// 3. Google Play & Reviewers Instant Test Login
+app.post('/api/auth/googleplay-review', (_req: Request, res: Response) => {
+  const reviewUser = {
+    id: 'user-googleplay-reviewer',
+    name: 'Google Play Reviewer',
+    email: 'googleplay_test@arzon.tj',
+    phone: '+992 90 000 0000',
+    balance: 50,
+    joinedDate: '2026',
+    isVerified: true,
+    rating: 5.0,
+    reviewsCount: 24,
+  };
+  return res.json({
+    success: true,
+    user: reviewUser,
+    message: 'Воридшавии ҳисоби санҷишии Google Play бомуваффақият иҷро шуд',
+  });
+});
+
+// 4. Auth System Configuration Status Endpoint
+app.get('/api/auth/status', (_req: Request, res: Response) => {
+  const smsCfg = loadSmsConfig();
+  const osonConfigured = Boolean(
+    (process.env.OSONSMS_LOGIN && process.env.OSONSMS_HASH) ||
+    (smsCfg?.osonLogin && smsCfg?.osonHash)
+  );
+  const twilioConfigured = Boolean(
+    (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) ||
+    (smsCfg?.twilioSid && smsCfg?.twilioToken)
+  );
+  const supabaseConfig = loadSupabaseConfig();
+  const supabaseConfigured = Boolean(process.env.VITE_SUPABASE_ANON_KEY || supabaseConfig?.anonKey);
+
+  res.json({
+    success: true,
+    supabaseAuth: {
+      available: true,
+      configured: supabaseConfigured,
+      supportsEmail: true,
+      supportsPasswordReset: true,
+    },
+    smsGateway: {
+      osonSms: osonConfigured,
+      twilio: twilioConfigured,
+      readyForProductionSms: osonConfigured || twilioConfigured,
+      activeProvider: osonConfigured ? 'osonsms' : twilioConfigured ? 'twilio' : 'none',
+      instruction: 'Барои фаъол кардани СМС-и воқеӣ ба телефонҳо, OSONSMS_LOGIN ва OSONSMS_HASH-ро ба .env илова намоед ё тавассути танзимоти сервер фаъол кунед.',
+    },
+  });
+});
+
+// 5. SMS Gateway Configuration Management Endpoint
+app.get('/api/auth/sms-config', (_req: Request, res: Response) => {
+  const smsCfg = loadSmsConfig();
+  const osonLogin = process.env.OSONSMS_LOGIN || smsCfg?.osonLogin;
+  const osonConfigured = Boolean((process.env.OSONSMS_LOGIN && process.env.OSONSMS_HASH) || (smsCfg?.osonLogin && smsCfg?.osonHash));
+  const twilioConfigured = Boolean((process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) || (smsCfg?.twilioSid && smsCfg?.twilioToken));
+
+  res.json({
+    configured: osonConfigured || twilioConfigured,
+    provider: osonConfigured ? 'osonsms' : twilioConfigured ? 'twilio' : 'none',
+    osonLoginMasked: osonLogin ? `${osonLogin.slice(0, 3)}***` : undefined,
+    osonSender: process.env.OSONSMS_SENDER_NAME || smsCfg?.osonSenderName || 'Arzon.tj',
+  });
+});
+
+app.post('/api/auth/sms-config', (req: Request, res: Response) => {
+  const { osonLogin, osonHash, osonSenderName } = req.body || {};
+  if (!osonLogin || !osonHash) {
+    return res.status(400).json({ error: 'osonLogin and osonHash are required' });
+  }
+
+  const existing = loadSmsConfig() || {};
+  const updated: SmsGatewayConfig = {
+    ...existing,
+    osonLogin: String(osonLogin).trim(),
+    osonHash: String(osonHash).trim(),
+    osonSenderName: (osonSenderName && String(osonSenderName).trim()) || 'Arzon.tj',
+  };
+
+  saveSmsConfigFile(updated);
+  return res.json({
+    success: true,
+    message: 'Танзимоти OsonSMS бомуваффақият сабт шуд! Шлюзи СМС фаъол гардид.',
+    configured: true,
+    provider: 'osonsms',
+  });
+});
+
+
+// =============================================================================
 // SERVER-SIDE CHAT RELAY & SYNC (Hybrid sync alongside Supabase Realtime)
 // Ensures 100% two-way communication between mobile phones
 // =============================================================================

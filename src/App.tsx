@@ -295,6 +295,99 @@ export default function App() {
     });
   }, []);
 
+  // Listen to Supabase Auth State changes for persistent sessions
+  useEffect(() => {
+    const supabase = getSupabase();
+    if (!supabase) return;
+
+    // Function to populate and sync profile from Supabase
+    const syncUserProfileFromAuth = async (u: any) => {
+      const cleanEmail = (u.email || '').toLowerCase().trim();
+      if (!cleanEmail || cleanEmail.includes('@arzon-messenger.tj')) {
+        return;
+      }
+
+      let displayName = u.user_metadata?.name || cleanEmail.split('@')[0] || 'Корбари Arzon.tj';
+      let phoneStr = u.user_metadata?.phone || '';
+      let balance = 30;
+
+      try {
+        const { data: prof } = await supabase
+          .from('profiles')
+          .select('*')
+          .eq('id', u.id)
+          .maybeSingle();
+
+        if (prof) {
+          if (prof.name) displayName = prof.name;
+          if (prof.phone) phoneStr = prof.phone;
+          if (typeof prof.balance === 'number') balance = prof.balance;
+        } else {
+          // First time login - populate profile record
+          await supabase.from('profiles').upsert({
+            id: u.id,
+            name: displayName,
+            phone: phoneStr,
+            email: cleanEmail,
+            balance: balance,
+            joined_date: '2026',
+            is_verified: true,
+            updated_at: new Date().toISOString(),
+          });
+        }
+      } catch {
+        // ignore
+      }
+
+      const profileUser: UserProfile = {
+        id: u.id,
+        name: displayName,
+        email: cleanEmail,
+        phone: phoneStr || '+992 90 000 0000',
+        balance: balance,
+        joinedDate: '2026',
+        isVerified: true,
+        rating: 5.0,
+        reviewsCount: 1,
+      };
+
+      setCurrentUser(profileUser);
+      try {
+        localStorage.setItem('arzontj_user', JSON.stringify(profileUser));
+      } catch {
+        // ignore
+      }
+    };
+
+    // 1. Initial session check on mount
+    supabase.auth.getSession().then(({ data }) => {
+      if (data?.session?.user) {
+        syncUserProfileFromAuth(data.session.user);
+      }
+    });
+
+    // 2. Continuous listener for auth events (Sign In, Initial Session, Sign Out, User Updated)
+    const { data: authListener } = supabase.auth.onAuthStateChange(async (event, session) => {
+      if (event === 'SIGNED_OUT') {
+        setCurrentUser(null);
+        try {
+          localStorage.removeItem('arzontj_user');
+        } catch {
+          // ignore
+        }
+        return;
+      }
+
+      if (session?.user && (event === 'SIGNED_IN' || event === 'INITIAL_SESSION' || event === 'USER_UPDATED')) {
+        await syncUserProfileFromAuth(session.user);
+      }
+    });
+
+    return () => {
+      authListener?.subscription?.unsubscribe();
+    };
+  }, []);
+
   const handleLoginSuccess = (user: UserProfile) => {
     setCurrentUser(user);
     localStorage.setItem('arzontj_user', JSON.stringify(user));
@@ -324,7 +417,15 @@ export default function App() {
 
   const handleLogout = () => {
     setCurrentUser(null);
-    localStorage.removeItem('arzontj_user');
+    try {
+      localStorage.removeItem('arzontj_user');
+      const supabase = getSupabase();
+      if (supabase) {
+        supabase.auth.signOut().catch(() => {});
+      }
+    } catch {
+      // ignore
+    }
     setToastMessage(
       language === 'tg'
         ? 'Шумо аз ҳисоб баромадед'
