@@ -370,11 +370,20 @@ export const AuthModal: React.FC<AuthModalProps> = ({
 
     setIsEmailLoading(true);
 
+    const publicSiteUrl = 'https://ais-pre-hu47nziap5pe35pxo7idqh-834128145452.asia-east1.run.app';
+    const redirectUrl =
+      typeof window !== 'undefined' &&
+      window.location.origin &&
+      !window.location.origin.includes('localhost') &&
+      !window.location.origin.includes('capacitor://')
+        ? window.location.origin
+        : publicSiteUrl;
+
     try {
       // 1. Password Reset Request
       if (showForgotPassword) {
         const { error: resetErr } = await supabase.auth.resetPasswordForEmail(cleanEmail, {
-          redirectTo: typeof window !== 'undefined' ? window.location.origin : undefined,
+          redirectTo: redirectUrl,
         });
         if (resetErr) {
           const isRateLimit =
@@ -440,7 +449,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
               name: fullName.trim() || cleanEmail.split('@')[0],
               phone: cleanPhoneNum,
             },
-            emailRedirectTo: typeof window !== 'undefined' ? window.location.origin : undefined,
+            emailRedirectTo: redirectUrl,
           },
         });
 
